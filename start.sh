@@ -3,6 +3,17 @@ set -e
 
 echo "=== Marvin Backend Startup ==="
 
+# 0. Write .env from RunPod environment variables
+echo "[0/4] Writing .env file..."
+cat > /app/backend/.env <<EOF
+MONGO_URL=${MONGO_URL}
+DB_NAME=${DB_NAME}
+ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+EMERGENT_LLM_KEY=${EMERGENT_LLM_KEY}
+CORS_ORIGINS=${CORS_ORIGINS}
+EOF
+echo "  .env written."
+
 # 1. Install/upgrade dependencies
 echo "[1/4] Installing Python dependencies..."
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118 --quiet
