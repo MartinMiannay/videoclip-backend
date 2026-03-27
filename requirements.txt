@@ -1,0 +1,30 @@
+# Core API
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Video processing
+ffmpeg-python>=0.2.0
+
+# Transcription — requires torch (install separately, ask before doing so)
+openai-whisper>=20231117
+# torch and torchaudio must be installed first:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
+#   (or cpu: https://download.pytorch.org/whl/cpu)
+
+# Claude API
+anthropic>=0.25.0
+
+# Face detection
+mediapipe>=0.10.14
+opencv-python>=4.9.0
+
+# Database
+motor>=3.3.0       # async MongoDB driver
+pymongo>=4.6.0
+
+# Storage (keep existing — adjust to your provider)
+boto3>=1.34.0      # if using S3-compatible storage
+
+# Utilities
+python-multipart>=0.0.9   # for FastAPI file uploads
+aiofiles>=23.2.1

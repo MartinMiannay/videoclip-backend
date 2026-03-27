@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.log
+server.log
+pipeline_error.txt
+music/
+assets/cta_outro.mov
+assets/cta_preencoded.mp4
