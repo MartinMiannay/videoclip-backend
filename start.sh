@@ -4,7 +4,7 @@ set -e
 echo "=== Marvin Backend Startup ==="
 
 # 0. Write .env from RunPod environment variables
-echo "[0/4] Writing .env file..."
+echo "[0/5] Writing .env file..."
 cat > /app/backend/.env <<EOF
 MONGO_URL=${MONGO_URL}
 DB_NAME=${DB_NAME}
@@ -14,14 +14,19 @@ CORS_ORIGINS=${CORS_ORIGINS}
 EOF
 echo "  .env written."
 
-# 1. Install system deps + Python dependencies
-echo "[1/4] Installing dependencies..."
+# 1. Pull latest code from GitHub
+echo "[1/5] Pulling latest code..."
+cd /app
+git pull origin master || echo "  WARNING: git pull failed, continuing with existing code."
+
+# 2. Install system deps + Python dependencies
+echo "[2/5] Installing dependencies..."
 apt-get install -y --no-install-recommends libgles2-mesa libgl1-mesa-glx 2>/dev/null || true
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118 --quiet
 pip install -r /app/backend/requirements.txt --quiet
 
-# 2. Pre-download Whisper large model if not already cached
-echo "[2/4] Checking Whisper model cache..."
+# 3. Pre-download Whisper large model if not already cached
+echo "[3/5] Checking Whisper model cache..."
 python -c "
 import whisper, os
 cache = os.path.expanduser('~/.cache/whisper')
@@ -34,11 +39,11 @@ else:
     print('  Done.')
 "
 
-# 3. Create assets directory if needed
-echo "[3/4] Ensuring assets directory exists..."
+# 4. Create assets directory if needed
+echo "[4/5] Ensuring assets directory exists..."
 mkdir -p /app/backend/assets
 
-# 4. Start the server
-echo "[4/4] Starting uvicorn server on port 8000..."
+# 5. Start the server
+echo "[5/5] Starting uvicorn server on port 8000..."
 cd /app/backend
 exec uvicorn server:app --host 0.0.0.0 --port 8000
