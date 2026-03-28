@@ -26,6 +26,8 @@ from typing import Any
 
 import anthropic
 import mediapipe as mp
+from mediapipe.tasks import python as _mp_python
+from mediapipe.tasks.python import vision as _mp_vision
 import whisper
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -57,6 +59,12 @@ SPEAKER_SWITCH_MIN_FRAMES = 8   # minimum consecutive frames before switching
 ROOT_DIR = Path(__file__).parent
 MUSIC_DIR = ROOT_DIR / "music"
 ASSETS_DIR = ROOT_DIR / "assets"
+
+_FACE_MODEL_PATH = ROOT_DIR / "blaze_face_short_range.tflite"
+_FACE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_detector/"
+    "blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+)
 
 CTA_PATH = ASSETS_DIR / "cta_outro.mov"
 CTA_PREENCODED_PATH = ASSETS_DIR / "cta_preencoded.mp4"
@@ -338,6 +346,13 @@ def select_clips_with_claude(
 # 4. Face / speaker detection (MediaPipe)
 # ---------------------------------------------------------------------------
 
+def _ensure_face_model() -> None:
+    if not _FACE_MODEL_PATH.exists():
+        import urllib.request
+        logger.info("Downloading mediapipe face detection model to %s", _FACE_MODEL_PATH)
+        urllib.request.urlretrieve(_FACE_MODEL_URL, _FACE_MODEL_PATH)
+
+
 def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[dict]:
     """
     Sample frames from the video using MediaPipe Face Detection and record
@@ -349,10 +364,12 @@ def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[di
     """
     import cv2
 
-    mp_face = mp.solutions.face_detection  # type: ignore[attr-defined]
-    detector = mp_face.FaceDetection(
-        model_selection=1,          # model 1 = full-range (up to 5m), better for interviews
-        min_detection_confidence=FACE_CONF_THRESHOLD,
+    _ensure_face_model()
+    detector = _mp_vision.FaceDetector.create_from_options(
+        _mp_vision.FaceDetectorOptions(
+            base_options=_mp_python.BaseOptions(model_asset_path=str(_FACE_MODEL_PATH)),
+            min_detection_confidence=FACE_CONF_THRESHOLD,
+        )
     )
 
     cap = cv2.VideoCapture(video_path)
@@ -367,23 +384,19 @@ def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[di
             if not ret:
                 break
             if frame_idx % sample_every_n_frames == 0:
-                h, w = frame.shape[:2]
                 # MediaPipe expects RGB
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                result = detector.process(rgb)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                result = detector.detect(mp_image)
 
                 faces: list[dict] = []
                 if result.detections:
                     for det in result.detections:
-                        bbox = det.location_data.relative_bounding_box
-                        conf = det.score[0] if det.score else 0.0
-                        x = int(bbox.xmin * w)
-                        y = int(bbox.ymin * h)
-                        bw = int(bbox.width * w)
-                        bh = int(bbox.height * h)
+                        bbox = det.bounding_box  # absolute pixel coords in Tasks API
+                        conf = det.categories[0].score if det.categories else 0.0
                         faces.append({
-                            "x": max(0, x), "y": max(0, y),
-                            "w": bw, "h": bh,
+                            "x": max(0, bbox.origin_x), "y": max(0, bbox.origin_y),
+                            "w": bbox.width, "h": bbox.height,
                             "conf": float(conf),
                         })
 
