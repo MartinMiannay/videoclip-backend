@@ -983,10 +983,17 @@ def _render_clip_sync(
         if not combined_vf:
             combined_vf = "null"
 
+        # Write the filter to a file so it is never truncated when passed as a
+        # command-line argument (long subtitle chains easily exceed OS arg limits,
+        # which silently cuts off the last `between(t,X,Y)` expression).
+        vf_script = os.path.join(tmp_dir, "vf_script.txt")
+        with open(vf_script, "w", encoding="utf-8") as _fh:
+            _fh.write(combined_vf)
+
         text_burned = os.path.join(tmp_dir, "text.mp4")
         _run_ffmpeg([
             "-i", cropped,
-            "-vf", combined_vf,
+            "-filter_script:v", vf_script,
             "-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-c:a", "copy",
             "-y", text_burned,
