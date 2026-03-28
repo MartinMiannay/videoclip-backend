@@ -14,8 +14,9 @@ CORS_ORIGINS=${CORS_ORIGINS}
 EOF
 echo "  .env written."
 
-# 1. Install/upgrade dependencies
-echo "[1/4] Installing Python dependencies..."
+# 1. Install system deps + Python dependencies
+echo "[1/4] Installing dependencies..."
+apt-get install -y --no-install-recommends libgles2-mesa libgl1-mesa-glx 2>/dev/null || true
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118 --quiet
 pip install -r /app/backend/requirements.txt --quiet
 

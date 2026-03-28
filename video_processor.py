@@ -25,9 +25,17 @@ from pathlib import Path
 from typing import Any
 
 import anthropic
-import mediapipe as mp
-from mediapipe.tasks import python as _mp_python
-from mediapipe.tasks.python import vision as _mp_vision
+try:
+    import mediapipe as mp
+    from mediapipe.tasks import python as _mp_python
+    from mediapipe.tasks.python import vision as _mp_vision
+    _MEDIAPIPE_AVAILABLE = True
+except Exception as _mp_err:
+    logging.getLogger(__name__).warning(
+        "MediaPipe unavailable (%s) — falling back to OpenCV Haar cascade face detection",
+        _mp_err,
+    )
+    _MEDIAPIPE_AVAILABLE = False
 import whisper
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -353,15 +361,7 @@ def _ensure_face_model() -> None:
         urllib.request.urlretrieve(_FACE_MODEL_URL, _FACE_MODEL_PATH)
 
 
-def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[dict]:
-    """
-    Sample frames from the video using MediaPipe Face Detection and record
-    face bounding boxes.
-
-    Returns a list of dicts:
-    [{"time": float, "faces": [{"x", "y", "w", "h", "conf"}, ...]}, ...]
-    Faces within each frame are sorted left-to-right (speaker 0 = leftmost).
-    """
+def _detect_speakers_mediapipe(video_path: str, sample_every_n_frames: int) -> list[dict]:
     import cv2
 
     _ensure_face_model()
@@ -374,7 +374,6 @@ def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[di
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-
     detections: list[dict] = []
     frame_idx = 0
 
@@ -384,7 +383,6 @@ def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[di
             if not ret:
                 break
             if frame_idx % sample_every_n_frames == 0:
-                # MediaPipe expects RGB
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 result = detector.detect(mp_image)
@@ -392,7 +390,7 @@ def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[di
                 faces: list[dict] = []
                 if result.detections:
                     for det in result.detections:
-                        bbox = det.bounding_box  # absolute pixel coords in Tasks API
+                        bbox = det.bounding_box
                         conf = det.categories[0].score if det.categories else 0.0
                         faces.append({
                             "x": max(0, bbox.origin_x), "y": max(0, bbox.origin_y),
@@ -402,12 +400,72 @@ def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[di
 
                 detections.append({
                     "time": frame_idx / fps,
-                    "faces": sorted(faces, key=lambda f: f["x"]),  # left-to-right
+                    "faces": sorted(faces, key=lambda f: f["x"]),
                 })
             frame_idx += 1
     finally:
         cap.release()
         detector.close()
+
+    return detections
+
+
+def _detect_speakers_opencv(video_path: str, sample_every_n_frames: int) -> list[dict]:
+    import cv2
+
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    cascade = cv2.CascadeClassifier(cascade_path)
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    detections: list[dict] = []
+    frame_idx = 0
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % sample_every_n_frames == 0:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                rects = cascade.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
+                )
+                faces: list[dict] = []
+                if len(rects):
+                    for (x, y, w, h) in rects:
+                        faces.append({"x": int(x), "y": int(y), "w": int(w), "h": int(h), "conf": 0.9})
+
+                detections.append({
+                    "time": frame_idx / fps,
+                    "faces": sorted(faces, key=lambda f: f["x"]),
+                })
+            frame_idx += 1
+    finally:
+        cap.release()
+
+    return detections
+
+
+def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[dict]:
+    """
+    Sample frames from the video and record face bounding boxes.
+
+    Returns a list of dicts:
+    [{"time": float, "faces": [{"x", "y", "w", "h", "conf"}, ...]}, ...]
+    Faces within each frame are sorted left-to-right (speaker 0 = leftmost).
+
+    Uses MediaPipe if available, otherwise falls back to OpenCV Haar cascade
+    (handles headless servers where libGLESv2.so.2 is missing).
+    """
+    if _MEDIAPIPE_AVAILABLE:
+        try:
+            detections = _detect_speakers_mediapipe(video_path, sample_every_n_frames)
+        except Exception as e:
+            logger.warning("MediaPipe face detection failed (%s), falling back to OpenCV", e)
+            detections = _detect_speakers_opencv(video_path, sample_every_n_frames)
+    else:
+        detections = _detect_speakers_opencv(video_path, sample_every_n_frames)
 
     logger.info("Face detection complete — %d sampled frames, video: %s", len(detections), video_path)
     return detections
