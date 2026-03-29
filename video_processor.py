@@ -1157,11 +1157,16 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                 words = await asyncio.get_event_loop().run_in_executor(
                     None, transcribe_audio, audio_path
                 )
+                logger.info(
+                    "Transcription complete: %d words, last word ends at %.1fs",
+                    len(words), words[-1].end if words else 0,
+                )
             finally:
                 if os.path.exists(audio_path):
                     os.unlink(audio_path)
 
             # Persist transcript to DB for retry reuse
+            logger.info("Persisting transcript to DB (%d words)…", len(words))
             word_dicts = [
                 {"text": w.text, "start": w.start, "end": w.end, "precise": w.precise}
                 for w in words
@@ -1171,15 +1176,19 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                 {"id": project_id},
                 {"$set": {"transcript_words": word_dicts, "transcript": flat_transcript}},
             )
+            logger.info("Transcript persisted to DB OK")
 
             # ----------------------------------------------------------------
             # Step 2: Select clips with Claude
             # ----------------------------------------------------------------
+            logger.info("Updating progress to selecting_clips…")
             await set_progress("selecting_clips", 25, "Sélection des meilleurs clips…")
+            logger.info("set_progress OK — calling Claude for clip selection…")
 
             raw_clips = await asyncio.get_event_loop().run_in_executor(
                 None, select_clips_with_claude, words, project_id
             )
+            logger.info("Claude returned %d raw clips", len(raw_clips) if raw_clips else 0)
             if not raw_clips:
                 await set_progress("error", 0, "Aucun clip sélectionné.", status="error")
                 return
