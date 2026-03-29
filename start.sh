@@ -16,15 +16,25 @@ echo "  .env written."
 
 # 1. Pull latest code from GitHub
 echo "[1/5] Pulling latest code..."
+if [ -z "${GITHUB_TOKEN}" ]; then
+    echo "  ERROR: GITHUB_TOKEN env var is not set — cannot clone/pull"
+    exit 1
+fi
+REPO_URL="https://${GITHUB_TOKEN}@github.com/MartinMiannay/videoclip-backend.git"
 cd /app
 if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
-    git pull origin master && echo "  git pull OK: $(git rev-parse --short HEAD)" || echo "  WARNING: git pull failed"
+    echo "  Repo exists, pulling..."
+    git remote set-url origin "$REPO_URL"
+    git pull origin master
+    echo "  git pull OK — now on commit: $(git rev-parse HEAD)"
+    echo "  Commit message: $(git log -1 --pretty=%s)"
 else
-    echo "  WARNING: /app is not a git repo — cloning fresh..."
+    echo "  /app is not a git repo — cloning fresh..."
     cd /
     rm -rf /app
-    git clone https://github.com/MartinMiannay/videoclip-backend.git /app
-    echo "  Cloned: $(git -C /app rev-parse --short HEAD)"
+    git clone "$REPO_URL" /app
+    echo "  Clone OK — on commit: $(git -C /app rev-parse HEAD)"
+    echo "  Commit message: $(git -C /app log -1 --pretty=%s)"
 fi
 
 # 2. Install system deps + Python dependencies
