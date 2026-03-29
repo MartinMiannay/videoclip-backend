@@ -742,8 +742,15 @@ def build_title_card_filter(title: str, duration: float) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _escape_drawtext(text: str) -> str:
-    """Escape special characters for FFmpeg drawtext."""
+    """Escape special characters for FFmpeg drawtext text option.
+
+    Order matters: backslash first so we don't double-escape later substitutions.
+    % must be escaped as %% — FFmpeg drawtext expands %{pts} etc. at render time,
+    so a bare % (e.g. "20%") corrupts the filter string and causes cascading parse
+    failures that manifest as "Missing ')' in between(t".
+    """
     text = text.replace("\\", "\\\\")
+    text = text.replace("%", "%%")
     text = text.replace("'", "\\'")
     text = text.replace(":", "\\:")
     text = text.replace("[", "\\[")
@@ -993,7 +1000,7 @@ def _render_clip_sync(
             is_last = pass_idx == len(chunks) - 1
             out = text_burned if is_last else os.path.join(tmp_dir, f"sub_{pass_idx}.mp4")
             vf = ",".join(chunk)
-            logger.info("Pass %d/%d vf: %s", pass_idx + 1, len(chunks), vf[:120])
+            logger.info("Pass %d/%d vf (full): %s", pass_idx + 1, len(chunks), vf)
             _run_ffmpeg([
                 "-i", current_input,
                 "-vf", vf,
