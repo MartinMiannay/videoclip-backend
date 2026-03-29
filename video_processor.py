@@ -707,21 +707,15 @@ def _wrap_title(title: str, max_width: int, fontsize: int) -> tuple[list[str], i
     return [title], fs
 
 
-def build_title_card_filter(title: str, duration: float) -> str:
+def build_title_card_filter(title: str, duration: float) -> list[str]:
     """
-    Build an FFmpeg drawtext filter string that renders a title card
-    with a pill-shaped white background and black bold text.
-
-    Safe zone enforced: minimum SAFE_MARGIN px from all edges.
-    Max 2 lines, no mid-word breaks, no space removal.
-    Font size reduced until text fits within FRAME_W - 2*SAFE_MARGIN.
-    Card shown for first 3 seconds of the clip (or full duration if shorter).
+    Build FFmpeg drawtext filter fragments for the title card (one per line).
+    Returns a list of individual drawtext filter strings (not joined).
     """
     display_duration = min(3.0, duration)
     lines, fontsize = _wrap_title(title, MAX_TITLE_W, 72)
 
     line_height = int(fontsize * 1.4)
-    card_h = len(lines) * line_height + SUB_BOX_BORDER * 2
     card_top_y = SAFE_MARGIN + 60   # 60px below top safe zone
 
     filters: list[str] = []
@@ -740,7 +734,7 @@ def build_title_card_filter(title: str, duration: float) -> str:
             f":enable='between(t,0,{display_duration:.3f})'"
         )
 
-    return ",".join(filters)
+    return filters
 
 
 # ---------------------------------------------------------------------------
@@ -757,14 +751,14 @@ def _escape_drawtext(text: str) -> str:
     return text
 
 
-def build_subtitle_filters(cards: list[SubtitleCard]) -> str:
+def build_subtitle_filters(cards: list[SubtitleCard]) -> list[str]:
     """
-    Build FFmpeg drawtext filters for all subtitle cards.
-    Each card is rendered as UPPERCASE text with a white pill background
-    at SUB_Y_RATIO of frame height.
+    Build FFmpeg drawtext filter fragments for all subtitle cards.
+    Returns a list of individual drawtext filter strings (not joined),
+    so callers can chunk them into batches before passing to FFmpeg.
     """
     if not cards:
-        return ""
+        return []
 
     sub_y = int(FRAME_H * SUB_Y_RATIO)
     filters: list[str] = []
@@ -786,7 +780,7 @@ def build_subtitle_filters(cards: list[SubtitleCard]) -> str:
             f":enable='between(t,{t_start},{t_end})'"
         )
 
-    return ",".join(filters)
+    return filters
 
 
 # ---------------------------------------------------------------------------
@@ -975,31 +969,41 @@ def _render_clip_sync(
             "-y", cropped,
         ], desc=f"crop {spec.clip_id}")
 
-        # --- Step C+D: burn subtitles + title card ---
-        subtitle_filter = build_subtitle_filters(spec.subtitle_cards)
-        title_filter = build_title_card_filter(spec.title, duration)
+        # --- Step C+D: burn subtitles + title card (≤10 drawtext per pass) ---
+        # Each drawtext filter contains commas inside between(t,X,Y), so we
+        # keep them as a list and chunk the list — never split a joined string.
+        all_drawtext: list[str] = (
+            build_subtitle_filters(spec.subtitle_cards)
+            + build_title_card_filter(spec.title, duration)
+        )
 
-        combined_vf = ",".join(f for f in [subtitle_filter, title_filter] if f)
-        if not combined_vf:
-            combined_vf = "null"
+        _CHUNK = 10
+        chunks = [all_drawtext[i:i + _CHUNK] for i in range(0, len(all_drawtext), _CHUNK)]
+        if not chunks:
+            chunks = [["null"]]
 
-        # Write the filter to a file so it is never truncated when passed as a
-        # command-line argument (long subtitle chains easily exceed OS arg limits,
-        # which silently cuts off the last `between(t,X,Y)` expression).
-        vf_script = os.path.join(tmp_dir, "vf_script.txt")
-        with open(vf_script, "w", encoding="utf-8") as _fh:
-            _fh.write(combined_vf)
-        logger.info("vf_script written to %s (%d chars): %s",
-                    vf_script, len(combined_vf), combined_vf[:120])
+        logger.info(
+            "Subtitle render: %d drawtext filters → %d pass(es) of ≤%d",
+            len(all_drawtext), len(chunks), _CHUNK,
+        )
 
         text_burned = os.path.join(tmp_dir, "text.mp4")
-        _run_ffmpeg([
-            "-i", cropped,
-            "-filter_script:v", vf_script,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-c:a", "copy",
-            "-y", text_burned,
-        ], desc=f"text {spec.clip_id}")
+        current_input = cropped
+        for pass_idx, chunk in enumerate(chunks):
+            is_last = pass_idx == len(chunks) - 1
+            out = text_burned if is_last else os.path.join(tmp_dir, f"sub_{pass_idx}.mp4")
+            vf = ",".join(chunk)
+            logger.info("Pass %d/%d vf: %s", pass_idx + 1, len(chunks), vf[:120])
+            _run_ffmpeg([
+                "-i", current_input,
+                "-vf", vf,
+                "-c:v", "libx264",
+                "-preset", "fast" if is_last else "ultrafast",
+                "-crf",  "18"    if is_last else "0",   # lossless intermediates
+                "-c:a", "copy",
+                "-y", out,
+            ], desc=f"text {spec.clip_id} {pass_idx + 1}/{len(chunks)}")
+            current_input = out
 
         # --- Step E: mix background music ---
         music_track = pick_music_track()
