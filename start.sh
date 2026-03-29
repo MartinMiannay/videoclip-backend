@@ -17,7 +17,15 @@ echo "  .env written."
 # 1. Pull latest code from GitHub
 echo "[1/5] Pulling latest code..."
 cd /app
-git pull origin master || echo "  WARNING: git pull failed, continuing with existing code."
+if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+    git pull origin master && echo "  git pull OK: $(git rev-parse --short HEAD)" || echo "  WARNING: git pull failed"
+else
+    echo "  WARNING: /app is not a git repo — cloning fresh..."
+    cd /
+    rm -rf /app
+    git clone https://github.com/MartinMiannay/videoclip-backend.git /app
+    echo "  Cloned: $(git -C /app rev-parse --short HEAD)"
+fi
 
 # 2. Install system deps + Python dependencies
 echo "[2/5] Installing dependencies..."

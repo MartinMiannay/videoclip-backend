@@ -873,7 +873,7 @@ def preencode_cta() -> None:
 def _run_ffmpeg(args: list[str], desc: str = "") -> None:
     """Run FFmpeg with the given arguments. Raises on non-zero exit."""
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"] + args
-    logger.debug("FFmpeg [%s]: %s", desc, " ".join(cmd))
+    logger.info("FFmpeg [%s]: %s", desc, " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, encoding='utf-8', errors='replace',
                             cwd=str(ROOT_DIR))
     if result.returncode != 0:
@@ -989,6 +989,8 @@ def _render_clip_sync(
         vf_script = os.path.join(tmp_dir, "vf_script.txt")
         with open(vf_script, "w", encoding="utf-8") as _fh:
             _fh.write(combined_vf)
+        logger.info("vf_script written to %s (%d chars): %s",
+                    vf_script, len(combined_vf), combined_vf[:120])
 
         text_burned = os.path.join(tmp_dir, "text.mp4")
         _run_ffmpeg([
