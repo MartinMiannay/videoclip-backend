@@ -60,6 +60,10 @@ SUB_Y_RATIO = 0.72        # vertical position as fraction of frame height
 SUB_SHIFT_MS = 0.100      # shift card 100 ms earlier than word start
 SUB_SILENCE_GAP = 0.3     # gap in seconds that means silence (no card)
 
+# Set False to skip all drawtext rendering (subtitles + title card).
+# Disable while debugging FFmpeg filter parse errors; re-enable once rendering works.
+SUBTITLES_ENABLED = False
+
 # Face detection thresholds
 FACE_CONF_THRESHOLD = 0.7
 SPEAKER_SWITCH_MIN_FRAMES = 8   # minimum consecutive frames before switching
@@ -976,41 +980,43 @@ def _render_clip_sync(
             "-y", cropped,
         ], desc=f"crop {spec.clip_id}")
 
-        # --- Step C+D: burn subtitles + title card (≤10 drawtext per pass) ---
-        # Each drawtext filter contains commas inside between(t,X,Y), so we
-        # keep them as a list and chunk the list — never split a joined string.
-        all_drawtext: list[str] = (
-            build_subtitle_filters(spec.subtitle_cards)
-            + build_title_card_filter(spec.title, duration)
-        )
-
-        _CHUNK = 10
-        chunks = [all_drawtext[i:i + _CHUNK] for i in range(0, len(all_drawtext), _CHUNK)]
-        if not chunks:
-            chunks = [["null"]]
-
-        logger.info(
-            "Subtitle render: %d drawtext filters → %d pass(es) of ≤%d",
-            len(all_drawtext), len(chunks), _CHUNK,
-        )
-
+        # --- Step C+D: burn subtitles + title card ---
         text_burned = os.path.join(tmp_dir, "text.mp4")
-        current_input = cropped
-        for pass_idx, chunk in enumerate(chunks):
-            is_last = pass_idx == len(chunks) - 1
-            out = text_burned if is_last else os.path.join(tmp_dir, f"sub_{pass_idx}.mp4")
-            vf = ",".join(chunk)
-            logger.info("Pass %d/%d vf (full): %s", pass_idx + 1, len(chunks), vf)
-            _run_ffmpeg([
-                "-i", current_input,
-                "-vf", vf,
-                "-c:v", "libx264",
-                "-preset", "fast" if is_last else "ultrafast",
-                "-crf",  "18"    if is_last else "0",   # lossless intermediates
-                "-c:a", "copy",
-                "-y", out,
-            ], desc=f"text {spec.clip_id} {pass_idx + 1}/{len(chunks)}")
-            current_input = out
+        if SUBTITLES_ENABLED:
+            # Each drawtext filter contains commas inside between(t,X,Y), so we
+            # keep them as a list and chunk the list — never split a joined string.
+            all_drawtext: list[str] = (
+                build_subtitle_filters(spec.subtitle_cards)
+                + build_title_card_filter(spec.title, duration)
+            )
+            _CHUNK = 10
+            chunks = [all_drawtext[i:i + _CHUNK] for i in range(0, len(all_drawtext), _CHUNK)]
+            if not chunks:
+                chunks = [["null"]]
+            logger.info(
+                "Subtitle render: %d drawtext filters → %d pass(es) of ≤%d",
+                len(all_drawtext), len(chunks), _CHUNK,
+            )
+            current_input = cropped
+            for pass_idx, chunk in enumerate(chunks):
+                is_last = pass_idx == len(chunks) - 1
+                out = text_burned if is_last else os.path.join(tmp_dir, f"sub_{pass_idx}.mp4")
+                vf = ",".join(chunk)
+                logger.info("Pass %d/%d vf (full): %s", pass_idx + 1, len(chunks), vf)
+                _run_ffmpeg([
+                    "-i", current_input,
+                    "-vf", vf,
+                    "-c:v", "libx264",
+                    "-preset", "fast" if is_last else "ultrafast",
+                    "-crf",  "18"    if is_last else "0",
+                    "-c:a", "copy",
+                    "-y", out,
+                ], desc=f"text {spec.clip_id} {pass_idx + 1}/{len(chunks)}")
+                current_input = out
+        else:
+            logger.info("Subtitles disabled (SUBTITLES_ENABLED=False) — copying cropped video")
+            import shutil as _shutil
+            _shutil.copy2(cropped, text_burned)
 
         # --- Step E: mix background music ---
         music_track = pick_music_track()
