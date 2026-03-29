@@ -62,6 +62,14 @@ async def startup():
     import sys
     IS_WINDOWS = sys.platform == "win32"
 
+    version_file = os.path.join(os.path.dirname(__file__), "VERSION.txt")
+    try:
+        with open(version_file) as _vf:
+            version = _vf.read().strip()
+    except FileNotFoundError:
+        version = "UNKNOWN (VERSION.txt missing)"
+    logger.info("=== SERVER VERSION: %s ===", version)
+
     try:
         init_storage()
         logger.info("Object storage initialized")
