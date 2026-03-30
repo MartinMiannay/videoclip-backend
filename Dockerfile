@@ -31,5 +31,6 @@ COPY . .
 RUN python -c "import whisper; whisper.load_model('large')"
 
 EXPOSE 8000
+EXPOSE 8001
 
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]

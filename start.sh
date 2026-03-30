@@ -61,9 +61,10 @@ else:
 echo "[4/5] Ensuring assets directory exists..."
 mkdir -p /app/backend/assets
 
-# 5. Kill any existing process on port 8000, then start fresh
-echo "[5/5] Starting uvicorn server on port 8000..."
-echo "  Checking for existing process on port 8000..."
+# 5. Kill any existing processes on ports 8000/8001, then start fresh
+echo "[5/5] Starting uvicorn servers on ports 8000 and 8001..."
 fuser -k 8000/tcp 2>/dev/null && echo "  Killed existing process on port 8000." || echo "  Port 8000 is free."
+fuser -k 8001/tcp 2>/dev/null && echo "  Killed existing process on port 8001." || echo "  Port 8001 is free."
 cd /app/backend
-exec uvicorn server:app --host 0.0.0.0 --port 8000
+uvicorn server:app --host 0.0.0.0 --port 8000 &
+exec uvicorn server:app --host 0.0.0.0 --port 8001
