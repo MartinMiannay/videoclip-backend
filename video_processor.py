@@ -62,7 +62,7 @@ SUB_SILENCE_GAP = 0.3     # gap in seconds that means silence (no card)
 
 # Set False to skip all drawtext rendering (subtitles + title card).
 # Disable while debugging FFmpeg filter parse errors; re-enable once rendering works.
-SUBTITLES_ENABLED = False
+SUBTITLES_ENABLED = True
 
 # Face detection thresholds
 FACE_CONF_THRESHOLD = 0.7
@@ -735,7 +735,7 @@ def build_title_card_filter(title: str, duration: float) -> list[str]:
             f":box=1"
             f":boxcolor=white@0.92"
             f":boxborderw={SUB_BOX_BORDER}"
-            f":enable='between(t,0,{display_duration:.3f})'"
+            f":enable='between(t\\,0\\,{display_duration:.3f})'"
         )
 
     return filters
@@ -788,7 +788,7 @@ def build_subtitle_filters(cards: list[SubtitleCard]) -> list[str]:
             f":box=1"
             f":boxcolor=white@1.0"
             f":boxborderw={SUB_BOX_BORDER}"
-            f":enable='between(t,{t_start},{t_end})'"
+            f":enable='between(t\\,{t_start}\\,{t_end})'"
         )
 
     return filters
@@ -833,6 +833,7 @@ def append_cta_fast(main_clip: str, output_path: str) -> None:
     try:
         _run_ffmpeg([
             "-f", "concat", "-safe", "0", "-i", concat_list,
+            "-map", "0:v:0", "-map", "0:a:0",
             "-c", "copy",
             "-y", output_path,
         ], desc="CTA append")
