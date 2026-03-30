@@ -828,7 +828,7 @@ def append_cta_fast(main_clip: str, output_path: str) -> None:
     _run_ffmpeg([
         "-i", main_clip,
         "-i", str(cta_file),
-        "-filter_complex", "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]",
+        "-filter_complex", "[0:v]setsar=1[v0];[1:v]setsar=1[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[outv][outa]",
         "-map", "[outv]", "-map", "[outa]",
         "-c:v", "libx264", "-profile:v", "baseline", "-level", "4.0",
         "-preset", "fast", "-crf", "18",
