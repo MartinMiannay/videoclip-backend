@@ -5,6 +5,6 @@ __pycache__/
 *.log
 server.log
 pipeline_error.txt
-music/
+music/*.m4a
 assets/cta_outro.mov
 assets/cta_preencoded.mp4
