@@ -755,7 +755,7 @@ def _escape_drawtext(text: str) -> str:
     """
     text = text.replace("\\", "\\\\")
     text = text.replace("%", "%%")
-    text = text.replace("'", "\\'")
+    text = text.replace("'", "\u2019")
     text = text.replace(":", "\\:")
     text = text.replace("[", "\\[")
     text = text.replace("]", "\\]")
