@@ -66,7 +66,7 @@ SUBTITLES_ENABLED = True
 
 # Face detection thresholds
 FACE_CONF_THRESHOLD = 0.7
-SPEAKER_SWITCH_MIN_FRAMES = 8   # minimum consecutive frames before switching
+SPEAKER_SWITCH_MIN_FRAMES = 3   # minimum consecutive frames before switching (~0.4 s at 15-frame sample rate)
 
 ROOT_DIR = Path(__file__).parent
 MUSIC_DIR = ROOT_DIR / "music"
@@ -602,10 +602,10 @@ def build_dynamic_crop_filter(
         candidate_speaker = prev_speaker
 
         if len(faces) >= 2:
-            # If we have a word active near this time, guess speaker from position
             if active_words:
-                # Heuristic: alternate based on word index parity (rough)
-                candidate_speaker = 0  # default to speaker 0
+                # Heuristic: alternate speaker based on word index parity
+                word_idx = words.index(active_words[0]) if active_words[0] in words else 0
+                candidate_speaker = word_idx % 2
             else:
                 candidate_speaker = prev_speaker  # silence → stay
 
@@ -639,6 +639,13 @@ def build_dynamic_crop_filter(
             seg_start = t
             seg_spk = spk
     segments.append({"start": seg_start, "end": clip_duration, "speaker": seg_spk})
+    logger.info(
+        "build_dynamic_crop_filter: %d speech segment(s) detected for clip [%.2f–%.2f]: %s",
+        len(segments),
+        clip_start,
+        clip_end,
+        [(round(s["start"], 2), round(s["end"], 2), s["speaker"]) for s in segments],
+    )
 
     # Build crop per segment using faces from that speaker
     crop_parts: list[str] = []
@@ -1334,13 +1341,28 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                             f"Rendered file too small: {os.path.getsize(local_path)} bytes"
                         )
 
-                    # Upload — put_object(path, bytes, content_type)
+                    # Upload — put_object(path, bytes, content_type) with retry on SSL errors
                     storage_path = f"clips/{project_id}/{spec.clip_id}.mp4"
                     with open(local_path, "rb") as fh:
                         video_bytes = fh.read()
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, _put_object, storage_path, video_bytes, "video/mp4"
-                    )
+                    upload_attempts = 3
+                    for attempt in range(1, upload_attempts + 1):
+                        try:
+                            await asyncio.get_event_loop().run_in_executor(
+                                None, _put_object, storage_path, video_bytes, "video/mp4"
+                            )
+                            break
+                        except Exception as upload_exc:
+                            import ssl
+                            is_ssl = isinstance(upload_exc, ssl.SSLError) or "ssl" in str(upload_exc).lower()
+                            if is_ssl and attempt < upload_attempts:
+                                logger.warning(
+                                    "Clip %s upload attempt %d/%d failed (SSL): %s — retrying in 5 s",
+                                    spec.clip_id, attempt, upload_attempts, upload_exc,
+                                )
+                                await asyncio.sleep(5)
+                            else:
+                                raise
 
                     done_count += 1
                     progress = 35 + int(done_count / total * 60)
