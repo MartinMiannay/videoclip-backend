@@ -39,7 +39,7 @@ fi
 
 # 2. Install system deps + Python dependencies
 echo "[2/5] Installing dependencies..."
-apt-get install -y --no-install-recommends libgles2-mesa libgl1-mesa-glx 2>/dev/null || true
+apt-get install -y --no-install-recommends libgles2 libgl1 2>/dev/null || true
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118 --quiet
 pip install -r /app/backend/requirements.txt --quiet
 

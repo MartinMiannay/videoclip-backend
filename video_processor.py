@@ -417,8 +417,23 @@ def _detect_speakers_mediapipe(video_path: str, sample_every_n_frames: int) -> l
 def _detect_speakers_opencv(video_path: str, sample_every_n_frames: int) -> list[dict]:
     import cv2
 
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    cascade = cv2.CascadeClassifier(cascade_path)
+    frontal_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    profile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+
+    def _merge_rects(rects_a, rects_b) -> list[tuple]:
+        """Combine frontal + profile detections, dropping boxes that overlap >50%."""
+        merged = list(rects_a)
+        for (x2, y2, w2, h2) in rects_b:
+            overlaps = False
+            for (x1, y1, w1, h1) in merged:
+                ix = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+                iy = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
+                if ix * iy > 0.5 * w2 * h2:
+                    overlaps = True
+                    break
+            if not overlaps:
+                merged.append((x2, y2, w2, h2))
+        return merged
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -432,14 +447,20 @@ def _detect_speakers_opencv(video_path: str, sample_every_n_frames: int) -> list
                 break
             if frame_idx % sample_every_n_frames == 0:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                rects = cascade.detectMultiScale(
-                    gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
+                gray = cv2.equalizeHist(gray)
+                frontal = frontal_cascade.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=3, minSize=(40, 40)
                 )
-                faces: list[dict] = []
-                if len(rects):
-                    for (x, y, w, h) in rects:
-                        faces.append({"x": int(x), "y": int(y), "w": int(w), "h": int(h), "conf": 0.9})
-
+                profile = profile_cascade.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=3, minSize=(40, 40)
+                )
+                frontal = frontal if len(frontal) else []
+                profile = profile if len(profile) else []
+                all_rects = _merge_rects(frontal, profile)
+                faces: list[dict] = [
+                    {"x": int(x), "y": int(y), "w": int(w), "h": int(h), "conf": 0.9}
+                    for (x, y, w, h) in all_rects
+                ]
                 detections.append({
                     "time": frame_idx / fps,
                     "faces": sorted(faces, key=lambda f: f["x"]),
