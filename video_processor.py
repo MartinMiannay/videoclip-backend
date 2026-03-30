@@ -813,7 +813,7 @@ def pick_music_track() -> str | None:
 
 def append_cta_fast(main_clip: str, output_path: str) -> None:
     """
-    Concat main_clip + CTA outro using FFmpeg concat demuxer.
+    Concat main_clip + CTA outro using filter_complex concat.
     Only called after main_clip is fully written and non-empty.
     Raises if either file is missing or too small.
     """
@@ -825,20 +825,17 @@ def append_cta_fast(main_clip: str, output_path: str) -> None:
     if not cta_file.exists():
         raise FileNotFoundError(f"CTA outro not found: {cta_file}")
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-        concat_list = f.name
-        f.write(f"file '{os.path.abspath(main_clip).replace(os.sep, '/')}'\n")
-        f.write(f"file '{os.path.abspath(cta_file).replace(os.sep, '/')}'\n")
-
-    try:
-        _run_ffmpeg([
-            "-f", "concat", "-safe", "0", "-i", concat_list,
-            "-map", "0:v:0", "-map", "0:a:0",
-            "-c", "copy",
-            "-y", output_path,
-        ], desc="CTA append")
-    finally:
-        os.unlink(concat_list)
+    _run_ffmpeg([
+        "-i", main_clip,
+        "-i", str(cta_file),
+        "-filter_complex", "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]",
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-profile:v", "baseline", "-level", "4.0",
+        "-preset", "fast", "-crf", "18",
+        "-r", "30", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
+        "-y", output_path,
+    ], desc="CTA append")
 
 
 def preencode_cta() -> None:
