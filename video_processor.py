@@ -66,7 +66,6 @@ SUBTITLES_ENABLED = True
 
 # Face detection thresholds
 FACE_CONF_THRESHOLD = 0.7
-SPEAKER_SWITCH_MIN_FRAMES = 3   # minimum consecutive frames before switching (~0.4 s at 15-frame sample rate)
 
 ROOT_DIR = Path(__file__).parent
 MUSIC_DIR = ROOT_DIR / "music"
@@ -365,7 +364,8 @@ def _ensure_face_model() -> None:
         urllib.request.urlretrieve(_FACE_MODEL_URL, _FACE_MODEL_PATH)
 
 
-def _detect_speakers_mediapipe(video_path: str, sample_every_n_frames: int) -> list[dict]:
+def _collect_faces_mediapipe(video_path: str, sample_every_n_frames: int) -> list[dict]:
+    """Collect all face detections across sampled frames. Returns [{cx, area}, ...]."""
     import cv2
 
     _ensure_face_model()
@@ -377,8 +377,7 @@ def _detect_speakers_mediapipe(video_path: str, sample_every_n_frames: int) -> l
     )
 
     cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    detections: list[dict] = []
+    faces: list[dict] = []
     frame_idx = 0
 
     try:
@@ -390,54 +389,28 @@ def _detect_speakers_mediapipe(video_path: str, sample_every_n_frames: int) -> l
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 result = detector.detect(mp_image)
-
-                faces: list[dict] = []
                 if result.detections:
                     for det in result.detections:
                         bbox = det.bounding_box
-                        conf = det.categories[0].score if det.categories else 0.0
                         faces.append({
-                            "x": max(0, bbox.origin_x), "y": max(0, bbox.origin_y),
-                            "w": bbox.width, "h": bbox.height,
-                            "conf": float(conf),
+                            "cx": bbox.origin_x + bbox.width // 2,
+                            "area": bbox.width * bbox.height,
                         })
-
-                detections.append({
-                    "time": frame_idx / fps,
-                    "faces": sorted(faces, key=lambda f: f["x"]),
-                })
             frame_idx += 1
     finally:
         cap.release()
         detector.close()
 
-    return detections
+    return faces
 
 
-def _detect_speakers_opencv(video_path: str, sample_every_n_frames: int) -> list[dict]:
+def _collect_faces_opencv(video_path: str, sample_every_n_frames: int) -> list[dict]:
+    """Collect all face detections across sampled frames. Returns [{cx, area}, ...]."""
     import cv2
 
     frontal_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    profile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
-
-    def _merge_rects(rects_a, rects_b) -> list[tuple]:
-        """Combine frontal + profile detections, dropping boxes that overlap >50%."""
-        merged = list(rects_a)
-        for (x2, y2, w2, h2) in rects_b:
-            overlaps = False
-            for (x1, y1, w1, h1) in merged:
-                ix = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
-                iy = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
-                if ix * iy > 0.5 * w2 * h2:
-                    overlaps = True
-                    break
-            if not overlaps:
-                merged.append((x2, y2, w2, h2))
-        return merged
-
     cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    detections: list[dict] = []
+    faces: list[dict] = []
     frame_idx = 0
 
     try:
@@ -448,52 +421,49 @@ def _detect_speakers_opencv(video_path: str, sample_every_n_frames: int) -> list
             if frame_idx % sample_every_n_frames == 0:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 gray = cv2.equalizeHist(gray)
-                frontal = frontal_cascade.detectMultiScale(
+                detected = frontal_cascade.detectMultiScale(
                     gray, scaleFactor=1.1, minNeighbors=3, minSize=(40, 40)
                 )
-                profile = profile_cascade.detectMultiScale(
-                    gray, scaleFactor=1.1, minNeighbors=3, minSize=(40, 40)
-                )
-                frontal = frontal if len(frontal) else []
-                profile = profile if len(profile) else []
-                all_rects = _merge_rects(frontal, profile)
-                faces: list[dict] = [
-                    {"x": int(x), "y": int(y), "w": int(w), "h": int(h), "conf": 0.9}
-                    for (x, y, w, h) in all_rects
-                ]
-                detections.append({
-                    "time": frame_idx / fps,
-                    "faces": sorted(faces, key=lambda f: f["x"]),
-                })
+                for (x, y, w, h) in (detected if len(detected) else []):
+                    faces.append({"cx": int(x + w // 2), "area": int(w * h)})
             frame_idx += 1
     finally:
         cap.release()
 
-    return detections
+    return faces
 
 
-def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[dict]:
+def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[int]:
     """
-    Sample frames from the video and record face bounding boxes.
-
-    Returns a list of dicts:
-    [{"time": float, "faces": [{"x", "y", "w", "h", "conf"}, ...]}, ...]
-    Faces within each frame are sorted left-to-right (speaker 0 = leftmost).
-
-    Uses MediaPipe if available, otherwise falls back to OpenCV Haar cascade
-    (handles headless servers where libGLESv2.so.2 is missing).
+    Return X center positions of the up to two largest faces found in the video,
+    sorted left to right. Returns [] (no faces), [x] (one speaker), or
+    [x_left, x_right] (two speakers).
     """
     if _MEDIAPIPE_AVAILABLE:
         try:
-            detections = _detect_speakers_mediapipe(video_path, sample_every_n_frames)
+            faces = _collect_faces_mediapipe(video_path, sample_every_n_frames)
         except Exception as e:
             logger.warning("MediaPipe face detection failed (%s), falling back to OpenCV", e)
-            detections = _detect_speakers_opencv(video_path, sample_every_n_frames)
+            faces = _collect_faces_opencv(video_path, sample_every_n_frames)
     else:
-        detections = _detect_speakers_opencv(video_path, sample_every_n_frames)
+        faces = _collect_faces_opencv(video_path, sample_every_n_frames)
 
-    logger.info("Face detection complete — %d sampled frames, video: %s", len(detections), video_path)
-    return detections
+    if not faces:
+        logger.info("No faces detected in %s", video_path)
+        return []
+
+    # Sort by area descending, pick up to 2 spatially distinct faces
+    MIN_X_SEP = 100  # px — faces closer than this are the same person
+    speakers: list[int] = []
+    for face in sorted(faces, key=lambda f: f["area"], reverse=True):
+        if not any(abs(face["cx"] - sx) < MIN_X_SEP for sx in speakers):
+            speakers.append(face["cx"])
+        if len(speakers) == 2:
+            break
+
+    result = sorted(speakers)
+    logger.info("detect_speakers: %d speaker(s) at X=%s in %s", len(result), result, video_path)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +471,7 @@ def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[di
 # ---------------------------------------------------------------------------
 
 def build_dynamic_crop_filter(
-    detections: list[dict],
+    speaker_xs: list[int],
     source_w: int,
     source_h: int,
     clip_start: float,
@@ -509,184 +479,46 @@ def build_dynamic_crop_filter(
     words: list[Word],
 ) -> str:
     """
-    Build an FFmpeg sendcmd / crop expression that follows the active speaker.
-
-    Rules:
-    - Default is always speaker 0 (leftmost face), never center-of-frame
-    - Only switch to speaker 1 when they are actively speaking
-    - Never cut to a frame with no detected face
-    - If only one speaker ever detected, never switch
-    - Minimum SPEAKER_SWITCH_MIN_FRAMES before a switch is committed
-
-    Returns an FFmpeg filter_complex crop+scale string.
+    Build an FFmpeg crop+scale filter string.
+    With two speakers, switches between their X positions at speech pauses.
+    With one speaker, stays on that face. With none, center crops.
     """
-    clip_duration = clip_end - clip_start
+    crop_w = source_h * 9 // 16
 
-    # Filter detections to clip window, re-zero timestamps
-    local_dets = [
-        {**d, "time": d["time"] - clip_start}
-        for d in detections
-        if clip_start <= d["time"] <= clip_end
-    ]
+    def clamp_x(cx: int) -> int:
+        return max(0, min(source_w - crop_w, cx - crop_w // 2))
 
-    # Determine how many unique speaker positions exist
-    max_speakers = max(
-        (len(d["faces"]) for d in local_dets if d["faces"]),
-        default=1,
-    )
-    has_two_speakers = max_speakers >= 2
-
-    # Build a timeline of "who is speaking" based on words proximity to
-    # detected faces (simple heuristic: whichever face changed more recently)
-    # For single-speaker videos just use a static crop on speaker 0.
-
-    def face_to_crop(face: dict) -> tuple[int, int]:
-        """Return (crop_x, crop_y) to center a 9:16 frame on this face."""
-        crop_w = source_h * 9 // 16   # 9:16 portrait crop width
-        face_cx = face["x"] + face["w"] // 2
-        face_cy = face["y"] + face["h"] // 2
-        cx = max(crop_w // 2, min(source_w - crop_w // 2, face_cx))
-        cy = max(FRAME_H // 2, min(source_h - FRAME_H // 2, face_cy))
-        x = cx - crop_w // 2
-        y = cy - FRAME_H // 2
-        return max(0, x), max(0, y)
-
-    if not local_dets or not any(d["faces"] for d in local_dets):
-        # No faces detected — center crop
-        crop_w = source_h * 9 // 16
+    if not speaker_xs:
         x = (source_w - crop_w) // 2
-        return (
-            f"crop={crop_w}:{source_h}:{x}:0,"
-            f"scale={FRAME_W}:{FRAME_H}:flags=lanczos"
-        )
+        return f"crop={crop_w}:{source_h}:{x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
-    # Build word-time-to-speaker map for two-speaker scenarios
-    # We use a simple rule: words before halfway point → speaker 0,
-    # but override when we detect clear speaker-1-only frames.
-    # A more sophisticated implementation would use diarization.
+    if len(speaker_xs) == 1:
+        x = clamp_x(speaker_xs[0])
+        return f"crop={crop_w}:{source_h}:{x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
-    crop_segments: list[tuple[float, float, int, int]] = []  # (t_start, t_end, x, y)
+    # Two speakers — switch on speech pauses
+    x0, x1 = clamp_x(speaker_xs[0]), clamp_x(speaker_xs[1])
+    clip_words = [w for w in words if clip_start <= w.start <= clip_end]
+    pause_times: list[float] = []
+    for i in range(len(clip_words) - 1):
+        if clip_words[i + 1].start - clip_words[i].end >= SUB_SILENCE_GAP:
+            pause_times.append(clip_words[i].end - clip_start)
 
-    if not has_two_speakers:
-        # Single speaker — find their dominant face position
-        all_faces = [d["faces"][0] for d in local_dets if d["faces"]]
-        if all_faces:
-            avg_x = int(sum(f["x"] for f in all_faces) / len(all_faces))
-            avg_w = int(sum(f["w"] for f in all_faces) / len(all_faces))
-            avg_cy = int(sum(f["y"] + f["h"] // 2 for f in all_faces) / len(all_faces))
-            crop_w = source_h * 9 // 16
-            face_cx = avg_x + avg_w // 2
-            cx = max(crop_w // 2, min(source_w - crop_w // 2, face_cx))
-            x = cx - crop_w // 2
-            y = max(0, avg_cy - FRAME_H // 2)
-            return (
-                f"crop={crop_w}:{source_h}:{max(0,x)}:{max(0,y)},"
-                f"scale={FRAME_W}:{FRAME_H}:flags=lanczos"
-            )
+    if not pause_times:
+        return f"crop={crop_w}:{source_h}:{x0}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
-    # Two speakers — switch based on active speaker heuristic
-    # Build per-frame speaker assignments
-    frame_speaker: list[tuple[float, int]] = []  # (time, speaker_idx)
-    prev_speaker = 0
-    consecutive = 0
+    # Build a nested FFmpeg if(lt(t,T),X,…) expression that toggles x0/x1 at each pause.
+    # Commas inside if() must be escaped as \, for FFmpeg's filter parser.
+    xs = [x0, x1]
+    expr = str(xs[len(pause_times) % 2])
+    for i, t in reversed(list(enumerate(pause_times))):
+        expr = f"if(lt(t\\,{t:.3f})\\,{xs[i % 2]}\\,{expr})"
 
-    for det in local_dets:
-        faces = det["faces"]
-        if not faces:
-            frame_speaker.append((det["time"], prev_speaker))
-            continue
-
-        t = det["time"]
-        # Find nearest word at this time
-        active_words = [w for w in words if w.start - clip_start <= t <= w.end - clip_start]
-        candidate_speaker = prev_speaker
-
-        if len(faces) >= 2:
-            if active_words:
-                # Heuristic: alternate speaker based on word index parity
-                word_idx = words.index(active_words[0]) if active_words[0] in words else 0
-                candidate_speaker = word_idx % 2
-            else:
-                candidate_speaker = prev_speaker  # silence → stay
-
-        if candidate_speaker == prev_speaker:
-            consecutive += 1
-        else:
-            consecutive = 1
-
-        if consecutive >= SPEAKER_SWITCH_MIN_FRAMES or candidate_speaker == prev_speaker:
-            prev_speaker = candidate_speaker
-
-        frame_speaker.append((t, prev_speaker))
-
-    # Convert frame assignments to crop segments
-    if not frame_speaker:
-        crop_w = source_h * 9 // 16
-        x = (source_w - crop_w) // 2
-        return (
-            f"crop={crop_w}:{source_h}:{x}:0,"
-            f"scale={FRAME_W}:{FRAME_H}:flags=lanczos"
-        )
-
-    # For each segment of consistent speaker, find average crop position
-    segments: list[dict] = []
-    seg_start = frame_speaker[0][0]
-    seg_spk = frame_speaker[0][1]
-
-    for t, spk in frame_speaker[1:]:
-        if spk != seg_spk:
-            segments.append({"start": seg_start, "end": t, "speaker": seg_spk})
-            seg_start = t
-            seg_spk = spk
-    segments.append({"start": seg_start, "end": clip_duration, "speaker": seg_spk})
     logger.info(
-        "build_dynamic_crop_filter: %d speech segment(s) detected for clip [%.2f–%.2f]: %s",
-        len(segments),
-        clip_start,
-        clip_end,
-        [(round(s["start"], 2), round(s["end"], 2), s["speaker"]) for s in segments],
+        "switch_crop: %d pause(s) in clip [%.2f–%.2f], x0=%d x1=%d",
+        len(pause_times), clip_start, clip_end, x0, x1,
     )
-
-    # Build crop per segment using faces from that speaker
-    crop_parts: list[str] = []
-    for seg in segments:
-        spk = seg["speaker"]
-        seg_dets = [
-            d for d in local_dets
-            if seg["start"] <= d["time"] <= seg["end"] and len(d["faces"]) > spk
-        ]
-        if seg_dets:
-            faces_in_seg = [d["faces"][spk] for d in seg_dets]
-            cx_avg = int(sum(f["x"] + f["w"] // 2 for f in faces_in_seg) / len(faces_in_seg))
-            cy_avg = int(sum(f["y"] + f["h"] // 2 for f in faces_in_seg) / len(faces_in_seg))
-        else:
-            # Fall back to speaker 0 from any detection in window
-            fallback = [d["faces"][0] for d in local_dets if d["faces"]]
-            if fallback:
-                cx_avg = int(sum(f["x"] + f["w"] // 2 for f in fallback) / len(fallback))
-                cy_avg = int(sum(f["y"] + f["h"] // 2 for f in fallback) / len(fallback))
-            else:
-                crop_w = source_h * 9 // 16
-                x = (source_w - crop_w) // 2
-                cx_avg = x + crop_w // 2
-                cy_avg = source_h // 2
-
-        crop_w = source_h * 9 // 16
-        x = max(0, min(source_w - crop_w, cx_avg - crop_w // 2))
-        y = max(0, min(source_h - FRAME_H, cy_avg - FRAME_H // 2))
-        crop_parts.append(
-            f"crop={crop_w}:{source_h}:{x}:{y},"
-            f"scale={FRAME_W}:{FRAME_H}:flags=lanczos"
-        )
-
-    # For multi-segment videos we return the FIRST segment's crop filter.
-    # True per-segment switching via FFmpeg sendcmd is complex; for now we use
-    # the dominant speaker's crop. Dynamic switching per segment can be layered
-    # on as a follow-up.
-    return crop_parts[0] if crop_parts else (
-        f"crop={source_h * 9 // 16}:{source_h}:{(source_w - source_h * 9 // 16) // 2}:0,"
-        f"scale={FRAME_W}:{FRAME_H}:flags=lanczos"
-    )
+    return f"crop={crop_w}:{source_h}:{expr}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
 
 # ---------------------------------------------------------------------------
