@@ -31,7 +31,8 @@ _fh.setFormatter(_log_fmt)
 logging.getLogger().addHandler(_fh)
 logging.getLogger().setLevel(logging.INFO)
 
-from storage import init_storage, put_object, get_object, APP_NAME
+from storage import init_storage, get_clip_path
+from fastapi.responses import FileResponse
 
 
 # --- Models ---
@@ -70,11 +71,7 @@ async def startup():
         version = "UNKNOWN (VERSION.txt missing)"
     logger.info("=== SERVER VERSION: %s ===", version)
 
-    try:
-        init_storage()
-        logger.info("Object storage initialized")
-    except Exception as e:
-        logger.error(f"Storage init failed: {e}")
+    init_storage()
 
     # Auto-install ffmpeg — Linux/container only (on Windows install manually)
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
@@ -357,6 +354,15 @@ async def retry_failed_clips(project_id: str):
     return {"message": f"Retrying {len(error_clips)} failed clips", "error_count": len(error_clips)}
 
 
+@api_router.get("/clips/{project_id}/{clip_id}/stream")
+async def stream_clip(project_id: str, clip_id: str):
+    """Stream a rendered clip directly from the RunPod volume."""
+    clip_path = get_clip_path(f"{project_id}/{clip_id}.mp4")
+    if not clip_path.exists():
+        raise HTTPException(404, "Clip not found")
+    return FileResponse(clip_path, media_type="video/mp4")
+
+
 @api_router.get("/clips/{project_id}/{clip_id}/download")
 async def download_clip(project_id: str, clip_id: str):
     project = await db.projects.find_one({"id": project_id}, {"_id": 0, "transcript_words": 0, "transcript": 0})
@@ -367,14 +373,15 @@ async def download_clip(project_id: str, clip_id: str):
     if not clip or not clip.get("storage_path"):
         raise HTTPException(404, "Clip not found or not ready")
 
-    data, content_type = get_object(clip["storage_path"])
-    # Sanitize filename — HTTP headers only support ASCII
+    clip_path = get_clip_path(clip["storage_path"])
+    if not clip_path.exists():
+        raise HTTPException(404, "Clip file not found on disk")
+
     import re
     safe_caption = re.sub(r'[^\w\s-]', '', clip.get('caption', 'untitled')[:30]).strip().replace(' ', '_')
     filename = f"clip_{safe_caption or 'untitled'}.mp4"
-    return Response(
-        content=data,
-        media_type="video/mp4",
+    return FileResponse(
+        clip_path, media_type="video/mp4",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
 

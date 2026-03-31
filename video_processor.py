@@ -126,8 +126,12 @@ VIRAL HOOK REFERENCE EXAMPLES (study these patterns):
 - "Vous ne payez pas assez votre comptable" — direct challenge
 - "Il n'a pas le choix, il doit vendre sa voiture" — dramatic consequence
 
-CLIP COUNT HARD LIMIT: Never generate more than 16 clips regardless of video \
-length. Always select the 16 strongest only. Quality over quantity.
+CLIP COUNT TARGET: Always select as many strong clips as the content supports:
+- 10–16 clips for a 30–60 min video (aim for the upper end, never below 10)
+- 5–9 clips for a 10–30 min video
+- 3–5 clips for a video under 10 min
+Hard maximum: 16. When in doubt, include the clip — never output fewer than \
+the minimum for the video length.
 
 OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 {
@@ -939,7 +943,7 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
       status, processing_step, processing_progress, processing_details,
       short_clips[].{id, caption, status, storage_path, error}
     """
-    from storage import put_object as _put_object
+    from storage import put_file as _put_file
 
     projects = db["projects"]
 
@@ -1173,28 +1177,11 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                             f"Rendered file too small: {os.path.getsize(local_path)} bytes"
                         )
 
-                    # Upload — put_object(path, bytes, content_type) with retry on SSL errors
-                    storage_path = f"clips/{project_id}/{spec.clip_id}.mp4"
-                    with open(local_path, "rb") as fh:
-                        video_bytes = fh.read()
-                    upload_attempts = 3
-                    for attempt in range(1, upload_attempts + 1):
-                        try:
-                            await asyncio.get_event_loop().run_in_executor(
-                                None, _put_object, storage_path, video_bytes, "video/mp4"
-                            )
-                            break
-                        except Exception as upload_exc:
-                            import ssl
-                            is_ssl = isinstance(upload_exc, ssl.SSLError) or "ssl" in str(upload_exc).lower()
-                            if is_ssl and attempt < upload_attempts:
-                                logger.warning(
-                                    "Clip %s upload attempt %d/%d failed (SSL): %s — retrying in 5 s",
-                                    spec.clip_id, attempt, upload_attempts, upload_exc,
-                                )
-                                await asyncio.sleep(5)
-                            else:
-                                raise
+                    # Save to /workspace/clips/ on the RunPod volume
+                    storage_path = f"{project_id}/{spec.clip_id}.mp4"
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, _put_file, local_path, storage_path
+                    )
 
                     done_count += 1
                     progress = 35 + int(done_count / total * 60)
