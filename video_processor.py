@@ -126,12 +126,8 @@ VIRAL HOOK REFERENCE EXAMPLES (study these patterns):
 - "Vous ne payez pas assez votre comptable" — direct challenge
 - "Il n'a pas le choix, il doit vendre sa voiture" — dramatic consequence
 
-CLIP COUNT TARGET: Always select as many strong clips as the content supports:
-- 10–16 clips for a 30–60 min video (aim for the upper end, never below 10)
-- 5–9 clips for a 10–30 min video
-- 3–5 clips for a video under 10 min
-Hard maximum: 16. When in doubt, include the clip — never output fewer than \
-the minimum for the video length.
+CLIP COUNT HARD LIMIT: Never generate more than 16 clips regardless of video \
+length. Always select the 16 strongest only. Quality over quantity.
 
 OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 {
