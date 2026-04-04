@@ -357,6 +357,7 @@ def _claude_json(system: str, user: str, label: str) -> Any:
     if not api_key:
         raise EnvironmentError("ANTHROPIC_API_KEY is not set")
     client = anthropic.Anthropic(api_key=api_key)
+    logger.info("Claude [%s] sending request — user msg %d chars", label, len(user))
     message = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=4096,
@@ -364,12 +365,17 @@ def _claude_json(system: str, user: str, label: str) -> Any:
         messages=[{"role": "user", "content": user}],
     )
     raw = message.content[0].text.strip()
+    logger.info(
+        "Claude [%s] raw response (%d chars, stop_reason=%s): %.500s",
+        label, len(raw), message.stop_reason, raw,
+    )
     raw = re.sub(r"^```[a-z]*\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw)
     try:
         result = json.loads(raw)
+        logger.info("Claude [%s] JSON parse OK", label)
     except json.JSONDecodeError as exc:
-        logger.error("Claude [%s] invalid JSON: %s", label, raw[:500])
+        logger.error("Claude [%s] JSON parse FAILED: %s", label, exc)
         raise ValueError(f"Claude [{label}] invalid JSON: {exc}") from exc
     logger.info("Claude [%s] done — sleeping %ds to respect rate limit…", label, _CLAUDE_RATE_LIMIT_SLEEP)
     time.sleep(_CLAUDE_RATE_LIMIT_SLEEP)
@@ -381,8 +387,12 @@ def segment_themes_with_claude(words: list[Word]) -> list[dict[str, Any]]:
     Step 1 — Thematic segmentation.
     Returns [{start, end, theme, description}, ...] (15–20 entries).
     """
-    logger.info("Step 1 — thematic segmentation…")
-    data = _claude_json(SEGMENT_PROMPT, words_to_transcript_text(words), "segmentation")
+    transcript = words_to_transcript_text(words)
+    logger.info(
+        "Step 1 — thematic segmentation — transcript: %d words, %d chars",
+        len(words), len(transcript),
+    )
+    data = _claude_json(SEGMENT_PROMPT, transcript, "segmentation")
     themes = data.get("themes", [])
     logger.info(
         "  Found %d themes:%s",
