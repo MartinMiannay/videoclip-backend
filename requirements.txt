@@ -6,7 +6,7 @@ uvicorn[standard]>=0.29.0
 ffmpeg-python>=0.2.0
 
 # Transcription — requires torch (install separately, ask before doing so)
-openai-whisper>=20231117
+whisperx
 # torch and torchaudio must be installed first:
 #   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
 #   (or cpu: https://download.pytorch.org/whl/cpu)

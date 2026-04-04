@@ -37,7 +37,7 @@ except Exception as _mp_err:
         _mp_err,
     )
     _MEDIAPIPE_AVAILABLE = False
-import whisper
+import whisperx
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 logger = logging.getLogger(__name__)
@@ -55,8 +55,8 @@ MAX_TITLE_W = FRAME_W - SAFE_MARGIN * 2   # 1000 px
 
 # Subtitle style
 SUB_FONT = "Arial-Bold"
-SUB_FONTSIZE = 58
-SUB_BOX_BORDER = 14       # boxborderw — gives pill/rounded look
+SUB_FONTSIZE = 52
+SUB_BORDER_W = 2          # thin black outline
 SUB_Y_RATIO = 0.72        # vertical position as fraction of frame height
 SUB_SHIFT_MS = 0.100      # shift card 100 ms earlier than word start
 SUB_SILENCE_GAP = 0.3     # gap in seconds that means silence (no card)
@@ -243,7 +243,7 @@ class SubtitleCard:
 
     @property
     def text(self) -> str:
-        return " ".join(w.text for w in self.words).upper()
+        return " ".join(w.text for w in self.words)
 
 
 @dataclass
@@ -264,27 +264,36 @@ class ClipSpec:
 
 def transcribe_audio(audio_path: str, language: str = "fr") -> list[Word]:
     """
-    Transcribe audio with local Whisper (large model) and return
-    word-level timestamps.  All words are marked precise=True because
-    Whisper's word_timestamps mode gives exact alignments.
+    Transcribe audio with WhisperX (large-v2 model) and return
+    word-level timestamps via forced alignment.
     """
-    logger.info("Loading Whisper large model…")
-    model = whisper.load_model("large")
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+
+    logger.info("Loading WhisperX large-v2 model on %s…", device)
+    model = whisperx.load_model("large-v2", device, compute_type=compute_type)
 
     logger.info("Transcribing %s …", audio_path)
-    result = model.transcribe(
-        audio_path,
-        word_timestamps=True,
-        language=language,
-        verbose=False,
+    result = model.transcribe(audio_path, language=language)
+
+    logger.info("Aligning word timestamps…")
+    align_model, align_metadata = whisperx.load_align_model(
+        language_code=language, device=device
+    )
+    result = whisperx.align(
+        result["segments"], align_model, align_metadata, audio_path, device,
+        return_char_alignments=False,
     )
 
     words: list[Word] = []
     for segment in result["segments"]:
-        seg_words = segment.get("words", [])
-        for w in seg_words:
+        for w in segment.get("words", []):
             raw = w.get("word", "").strip()
             if not raw:
+                continue
+            # whisperx may omit timestamps on rare unaligned words — skip those
+            if "start" not in w or "end" not in w:
                 continue
             words.append(Word(
                 text=raw,
@@ -893,13 +902,12 @@ def build_subtitle_filters(cards: list[SubtitleCard]) -> list[str]:
         filters.append(
             f"drawtext=fontfile={FONT_PATH}"
             f":fontsize={SUB_FONTSIZE}"
-            f":fontcolor=black"
+            f":fontcolor=white"
             f":text='{text}'"
             f":x=(w-text_w)/2"
             f":y={sub_y}"
-            f":box=1"
-            f":boxcolor=white@1.0"
-            f":boxborderw={SUB_BOX_BORDER}"
+            f":bordercolor=black"
+            f":borderw={SUB_BORDER_W}"
             f":enable='between(t\\,{t_start}\\,{t_end})'"
         )
 
