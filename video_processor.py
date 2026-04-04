@@ -128,48 +128,93 @@ OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 }
 """
 
-CLIP_SYSTEM_PROMPT = """\
-You are an expert short-form video editor specializing in French business and \
-entrepreneurship content. Your job is to extract the most viral, engaging clips \
-from a long interview transcript.
+THEME_FILTER_PROMPT = """\
+You are a viral content strategist for French business and entrepreneurship video.
 
-You will receive a list of pre-identified themes with their timestamps, followed \
-by the full transcript. Select the single best clip for each theme — one clip \
-per theme, maximum 16 clips total.
+You will receive a list of interview themes with their descriptions and transcript \
+excerpts. Score each theme from 1 to 10 based on its viral/business value for a \
+French short-form video audience (TikTok, Reels, YouTube Shorts).
 
-SELECTION CRITERIA:
-- Strong hook in the first 5 seconds (surprising stat, provocative question, \
-  bold claim, or relatable dilemma)
-- Clear standalone narrative arc — the clip must make sense without context
-- Emotional resonance: curiosity, admiration, controversy, or humor
-- French-speaking audience: relate to French/European business culture
-- Ideal duration: 45–90 seconds (never under 30s, never over 90s)
-- The clip must fall within the timestamp range of its theme
+SCORING GUIDE:
+- 9–10: Explosive hook potential — shocking stat, strong contrarian take, dramatic \
+  personal story, or aspirational achievement
+- 7–8: Clear value — solid business insight, relatable dilemma, or memorable quote
+- 5–6: Generic — standard advice with no memorable angle
+- 1–4: Discard — introductions, greetings, logistics, off-topic, or repetitive content
 
-VIRAL HOOK REFERENCE EXAMPLES (study these patterns):
-- "Embaucher ma femme c'est une bonne idée ?" — mundane decision reframed as \
-  personal dilemma
-- "Un téléphone pro ? Seulement quand on gagne 1 000 000 €" — shocking threshold
-- "Pourquoi faire du black vous appauvrit ?" — contrarian take
-- "Il fait 500 000€/an et voyage pendant 5 mois !" — aspirational stat
-- "Il ne travaille pas le samedi et le dimanche ?" — implied conflict
-- "Je ne peux pas survivre avec un loyer de 15 000 €" — quote framing
-- "Vous ne payez pas assez votre comptable" — direct challenge
-- "Il n'a pas le choix, il doit vendre sa voiture" — dramatic consequence
+OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
+{
+  "scores": [
+    {
+      "theme": "<exact theme label as provided>",
+      "score": <integer 1-10>,
+      "reason": "<one sentence>"
+    }
+  ]
+}
+"""
 
-CLIP COUNT HARD LIMIT: One clip per theme, never more than 16 clips total. \
-Quality over quantity — skip a theme if it has no strong viral moment.
+BOUNDARY_PROMPT = """\
+You are a precision video editor for French short-form business content.
+
+You will receive transcript excerpts, one per theme. For each theme find the \
+single best clip:
+
+START RULES — the hook must open on:
+- A surprising stat, bold claim, provocative question, or mid-tension moment
+- The exact word where the tension or insight begins
+- NEVER a greeting, filler phrase ("donc", "voilà", "eh bien"), or \
+  scene-setting sentence
+
+END RULES — cut immediately after:
+- The key insight or punchline lands
+- Before the speaker pivots to explanation, context, or a new point
+
+DURATION: 45–90 seconds. Reject any moment where no 30–90s window exists \
+and return nothing for that theme.
+
+VIRAL HOOK TITLE EXAMPLES:
+- "Embaucher ma femme c'est une bonne idée ?"
+- "Un téléphone pro ? Seulement quand on gagne 1 000 000 €"
+- "Pourquoi faire du black vous appauvrit ?"
+- "Il fait 500 000€/an et voyage pendant 5 mois !"
+- "Je ne peux pas survivre avec un loyer de 15 000 €"
 
 OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 {
   "clips": [
     {
+      "theme": "<exact theme label as provided>",
       "start": <float seconds>,
       "end": <float seconds>,
       "title": "<French hook title, max 60 chars>",
-      "hook": "<one sentence explaining why this clip is viral>"
+      "hook": "<one sentence explaining why this clip stops a scroll>"
     }
   ]
+}
+"""
+
+FINAL_FILTER_PROMPT = """\
+You are a ruthless short-form video editor for French business content.
+
+You will receive a set of proposed clips — each with its title, hook sentence, \
+and opening transcript lines. Keep ONLY the clips that would genuinely stop a \
+scroll on TikTok, Instagram Reels, or YouTube Shorts for a French business audience.
+
+REMOVE a clip if any of these are true:
+- The opening line is weak (greeting, transition, or generic statement)
+- The title fails to create curiosity or tension
+- The content is too generic — advice anyone could give
+- It is too similar to a stronger clip already in the list
+
+KEEP a clip only if ALL of these are true:
+- The first sentence grabs immediately
+- The title creates irresistible curiosity or a strong emotion
+- The content is specific, surprising, or emotionally resonant
+
+OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
+{
+  "keep": ["<exact title 1>", "<exact title 2>", ...]
 }
 """
 
@@ -324,110 +369,224 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
 
 
 # ---------------------------------------------------------------------------
-# 3. Claude thematic segmentation + clip selection
+# 3. Claude clip selection pipeline (5 steps)
 # ---------------------------------------------------------------------------
+
+def _claude_json(system: str, user: str, label: str) -> Any:
+    """Single Claude API call → parsed JSON. Strips markdown fences. Raises on failure."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise EnvironmentError("ANTHROPIC_API_KEY is not set")
+    client = anthropic.Anthropic(api_key=api_key)
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    )
+    raw = message.content[0].text.strip()
+    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.error("Claude [%s] invalid JSON: %s", label, raw[:500])
+        raise ValueError(f"Claude [{label}] invalid JSON: {exc}") from exc
+
+
+def _excerpt(theme: dict[str, Any], words: list[Word]) -> str:
+    """Return a timestamped transcript string for the words inside a theme window."""
+    theme_words = [w for w in words if theme["start"] <= w.start <= theme["end"]]
+    return words_to_transcript_text(theme_words)
+
+
+# Step 1 ─────────────────────────────────────────────────────────────────────
 
 def segment_themes_with_claude(words: list[Word]) -> list[dict[str, Any]]:
     """
-    Send the full transcript to Claude and return a list of theme dicts:
-    [{start, end, theme, description}, ...]
-    Between 10 and 20 themes.
+    Step 1 — Thematic segmentation.
+    Returns [{start, end, theme, description}, ...] (10–20 entries).
     """
-    transcript_text = words_to_transcript_text(words)
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise EnvironmentError("ANTHROPIC_API_KEY is not set")
-
-    client = anthropic.Anthropic(api_key=api_key)
-
-    logger.info("Sending transcript to Claude for thematic segmentation…")
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        system=THEME_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": transcript_text}],
-    )
-
-    raw = message.content[0].text.strip()
-    raw = re.sub(r"^```[a-z]*\n?", "", raw)
-    raw = re.sub(r"\n?```$", "", raw)
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        logger.error("Claude returned invalid JSON for themes: %s", raw[:500])
-        raise ValueError(f"Claude returned invalid JSON for themes: {exc}") from exc
-
+    logger.info("Step 1/5 — thematic segmentation…")
+    data = _claude_json(THEME_SYSTEM_PROMPT, words_to_transcript_text(words), "segmentation")
     themes = data.get("themes", [])
-    logger.info("Claude identified %d themes", len(themes))
+    logger.info("  → %d themes identified", len(themes))
     return themes
 
 
-def select_clips_with_claude(
+# Step 2 ─────────────────────────────────────────────────────────────────────
+
+def filter_themes_with_claude(
+    themes: list[dict[str, Any]],
     words: list[Word],
-    project_id: str,
-    themes: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Send the transcript (and optional themes) to Claude and return a list of
-    clip dicts: [{start, end, title, hook}, ...]
-    One clip per theme, max 16 clips.
+    Step 2 — First filter: score each theme for viral/business value (1–10).
+    Keep only themes scoring ≥ 7.
     """
-    transcript_text = words_to_transcript_text(words)
+    logger.info("Step 2/5 — scoring %d themes…", len(themes))
 
-    if themes:
-        themes_block = "THEMES IDENTIFIED IN THIS INTERVIEW:\n" + json.dumps(
-            themes, ensure_ascii=False, indent=2
-        ) + "\n\nFULL TRANSCRIPT:\n"
-        user_content = themes_block + transcript_text
-    else:
-        user_content = transcript_text
+    # Build user message: theme list + per-theme transcript excerpts
+    parts: list[str] = ["THEMES TO SCORE:\n"]
+    for t in themes:
+        parts.append(
+            f'Theme: "{t["theme"]}"\n'
+            f'Description: {t.get("description", "")}\n'
+            f'Timestamps: {t["start"]:.1f}s–{t["end"]:.1f}s\n'
+            f'Excerpt:\n{_excerpt(t, words)}\n'
+        )
+    user_msg = "\n---\n".join(parts)
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise EnvironmentError("ANTHROPIC_API_KEY is not set")
+    data = _claude_json(THEME_FILTER_PROMPT, user_msg, "theme-filter")
+    scores = {s["theme"]: s["score"] for s in data.get("scores", [])}
 
-    client = anthropic.Anthropic(api_key=api_key)
-
-    logger.info("Sending transcript to Claude for clip selection…")
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        system=CLIP_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_content}],
+    kept = [t for t in themes if scores.get(t["theme"], 0) >= 7]
+    logger.info(
+        "  → %d/%d themes kept (score ≥ 7): %s",
+        len(kept), len(themes),
+        [f'{t["theme"]}({scores.get(t["theme"], "?")})' for t in kept],
     )
+    return kept
 
-    raw = message.content[0].text.strip()
 
-    # Strip any accidental markdown fences
-    raw = re.sub(r"^```[a-z]*\n?", "", raw)
-    raw = re.sub(r"\n?```$", "", raw)
+# Step 3 ─────────────────────────────────────────────────────────────────────
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        logger.error("Claude returned invalid JSON: %s", raw[:500])
-        raise ValueError(f"Claude returned invalid JSON: {exc}") from exc
+def find_clip_boundaries_with_claude(
+    themes: list[dict[str, Any]],
+    words: list[Word],
+) -> list[dict[str, Any]]:
+    """
+    Step 3 — Clip boundaries: for each kept theme, Claude finds the exact hook
+    start and insight end.
+    Returns [{theme, start, end, title, hook}, ...].
+    """
+    logger.info("Step 3/5 — finding clip boundaries for %d themes…", len(themes))
 
-    clips = data.get("clips", [])
+    parts: list[str] = []
+    for t in themes:
+        parts.append(
+            f'Theme: "{t["theme"]}" [{t["start"]:.1f}s–{t["end"]:.1f}s]\n'
+            f'{_excerpt(t, words)}'
+        )
+    user_msg = "\n\n---\n\n".join(parts)
 
-    # Enforce limits and validate
+    data = _claude_json(BOUNDARY_PROMPT, user_msg, "boundaries")
+    raw_clips = data.get("clips", [])
+
+    # Validate duration constraints
     valid: list[dict[str, Any]] = []
-    for c in clips[:16]:
+    for c in raw_clips:
         start = float(c.get("start", 0))
         end = float(c.get("end", 0))
         duration = end - start
         if duration < CLIP_MIN_DURATION or duration > CLIP_MAX_DURATION:
             logger.warning(
-                "Clip '%s' skipped — duration %.1fs out of range",
-                c.get("title", "?"), duration,
+                "  Clip '%s' skipped — duration %.1fs out of range [%d–%d]",
+                c.get("title", "?"), duration, CLIP_MIN_DURATION, CLIP_MAX_DURATION,
             )
             continue
         valid.append(c)
 
-    logger.info("Claude selected %d valid clips", len(valid))
+    logger.info("  → %d valid clip boundaries found", len(valid))
     return valid
+
+
+# Step 4 ─────────────────────────────────────────────────────────────────────
+
+_SILENCE_TRIM_THRESHOLD = 1.5   # seconds
+
+def trim_clip_silences(
+    clips: list[dict[str, Any]],
+    words: list[Word],
+) -> list[dict[str, Any]]:
+    """
+    Step 4 — Internal silence trimming (no API call).
+    For each clip:
+    - Advance start forward to the first word if a leading silence > threshold exists.
+    - Pull end back to the last word's end if a trailing silence > threshold exists.
+    Clips that become too short after trimming are dropped.
+    """
+    logger.info("Step 4/5 — trimming silences for %d clips…", len(clips))
+    trimmed: list[dict[str, Any]] = []
+
+    for c in clips:
+        start = float(c["start"])
+        end = float(c["end"])
+        clip_words = [w for w in words if start <= w.start <= end]
+
+        if not clip_words:
+            logger.warning("  Clip '%s' has no words — dropping", c.get("title", "?"))
+            continue
+
+        new_start = start
+        new_end = end
+
+        # Trim leading silence
+        if clip_words[0].start - start > _SILENCE_TRIM_THRESHOLD:
+            new_start = clip_words[0].start
+            logger.debug(
+                "  Clip '%s': trimmed leading silence %.1fs → start %.1fs",
+                c.get("title", "?"), clip_words[0].start - start, new_start,
+            )
+
+        # Trim trailing silence
+        if end - clip_words[-1].end > _SILENCE_TRIM_THRESHOLD:
+            new_end = clip_words[-1].end + 0.3   # small breath after last word
+            logger.debug(
+                "  Clip '%s': trimmed trailing silence %.1fs → end %.1fs",
+                c.get("title", "?"), end - clip_words[-1].end, new_end,
+            )
+
+        duration = new_end - new_start
+        if duration < CLIP_MIN_DURATION:
+            logger.warning(
+                "  Clip '%s' dropped after silence trim — duration %.1fs < %ds",
+                c.get("title", "?"), duration, CLIP_MIN_DURATION,
+            )
+            continue
+
+        trimmed.append({**c, "start": new_start, "end": new_end})
+
+    logger.info("  → %d clips after silence trimming", len(trimmed))
+    return trimmed
+
+
+# Step 5 ─────────────────────────────────────────────────────────────────────
+
+def filter_clips_with_claude(
+    clips: list[dict[str, Any]],
+    words: list[Word],
+) -> list[dict[str, Any]]:
+    """
+    Step 5 — Final filter: Claude reviews all clips and removes any that
+    wouldn't stop a scroll.
+    Returns the surviving clip dicts.
+    """
+    logger.info("Step 5/5 — final scroll-stopping filter for %d clips…", len(clips))
+
+    parts: list[str] = []
+    for c in clips:
+        start = float(c["start"])
+        end = float(c["end"])
+        # Send only the opening ~15 seconds of words so Claude judges the hook
+        opening_words = [w for w in words if start <= w.start <= start + 15]
+        opening = words_to_transcript_text(opening_words) or "(no transcript)"
+        parts.append(
+            f'Title: {c.get("title", "")}\n'
+            f'Hook: {c.get("hook", "")}\n'
+            f'Opening lines:\n{opening}'
+        )
+    user_msg = "CLIPS TO REVIEW:\n\n" + "\n\n---\n\n".join(parts)
+
+    data = _claude_json(FINAL_FILTER_PROMPT, user_msg, "final-filter")
+    keep_titles = set(data.get("keep", []))
+
+    survivors = [c for c in clips if c.get("title", "") in keep_titles]
+    logger.info(
+        "  → %d/%d clips survived final filter",
+        len(survivors), len(clips),
+    )
+    return survivors
 
 
 # ---------------------------------------------------------------------------
@@ -1131,30 +1290,56 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
             logger.info("Transcript persisted to DB OK")
 
             # ----------------------------------------------------------------
-            # Step 2a: Thematic segmentation with Claude
+            # Step 2a: Thematic segmentation
             # ----------------------------------------------------------------
-            logger.info("Updating progress to segmenting_themes…")
-            await set_progress("segmenting_themes", 15, "Analyse thématique en cours…")
-            logger.info("set_progress OK — calling Claude for thematic segmentation…")
-
+            await set_progress("segmenting_themes", 12, "Segmentation thématique…")
             themes = await asyncio.get_event_loop().run_in_executor(
                 None, segment_themes_with_claude, words
             )
-            logger.info("Claude identified %d themes", len(themes))
+            if not themes:
+                await set_progress("error", 0, "Aucun thème identifié.", status="error")
+                return
 
             # ----------------------------------------------------------------
-            # Step 2b: Select clips with Claude (one per theme)
+            # Step 2b: First filter — score themes, keep ≥ 7/10
             # ----------------------------------------------------------------
-            logger.info("Updating progress to selecting_clips…")
-            await set_progress("selecting_clips", 25, "Sélection des meilleurs clips…")
-            logger.info("set_progress OK — calling Claude for clip selection…")
-
-            raw_clips = await asyncio.get_event_loop().run_in_executor(
-                None, select_clips_with_claude, words, project_id, themes
+            await set_progress("filtering_themes", 18, "Filtrage des thèmes…")
+            themes = await asyncio.get_event_loop().run_in_executor(
+                None, filter_themes_with_claude, themes, words
             )
-            logger.info("Claude returned %d raw clips", len(raw_clips) if raw_clips else 0)
+            if not themes:
+                await set_progress("error", 0, "Aucun thème retenu après filtrage.", status="error")
+                return
+
+            # ----------------------------------------------------------------
+            # Step 2c: Clip boundaries — exact hook start + insight end
+            # ----------------------------------------------------------------
+            await set_progress("finding_boundaries", 24, "Recherche des moments clés…")
+            raw_clips = await asyncio.get_event_loop().run_in_executor(
+                None, find_clip_boundaries_with_claude, themes, words
+            )
             if not raw_clips:
-                await set_progress("error", 0, "Aucun clip sélectionné.", status="error")
+                await set_progress("error", 0, "Aucune limite de clip trouvée.", status="error")
+                return
+
+            # ----------------------------------------------------------------
+            # Step 2d: Internal silence trimming (no API call)
+            # ----------------------------------------------------------------
+            raw_clips = trim_clip_silences(raw_clips, words)
+            if not raw_clips:
+                await set_progress("error", 0, "Tous les clips supprimés au trimming.", status="error")
+                return
+
+            # ----------------------------------------------------------------
+            # Step 2e: Final filter — scroll-stopping review
+            # ----------------------------------------------------------------
+            await set_progress("final_filter", 30, "Filtre final de qualité…")
+            raw_clips = await asyncio.get_event_loop().run_in_executor(
+                None, filter_clips_with_claude, raw_clips, words
+            )
+            logger.info("Pipeline clip selection complete — %d clips", len(raw_clips))
+            if not raw_clips:
+                await set_progress("error", 0, "Aucun clip retenu après filtre final.", status="error")
                 return
 
             # ----------------------------------------------------------------
@@ -1202,7 +1387,7 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
         # ----------------------------------------------------------------
         # Step 4: Face detection (shared across all clips)
         # ----------------------------------------------------------------
-        await set_progress("detecting_speakers", 30, "Détection des visages…")
+        await set_progress("detecting_speakers", 33, "Détection des visages…")
 
         source_w, source_h = await asyncio.get_event_loop().run_in_executor(
             None, get_video_dimensions, source_video_path
