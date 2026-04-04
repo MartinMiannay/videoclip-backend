@@ -19,6 +19,7 @@ import random
 import re
 import subprocess
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -372,8 +373,10 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
 # 3. Claude clip selection pipeline (5 steps)
 # ---------------------------------------------------------------------------
 
+_CLAUDE_RATE_LIMIT_SLEEP = 60   # seconds to wait after each Claude call
+
 def _claude_json(system: str, user: str, label: str) -> Any:
-    """Single Claude API call → parsed JSON. Strips markdown fences. Raises on failure."""
+    """Single Claude API call → parsed JSON. Sleeps after the call to avoid rate limits."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise EnvironmentError("ANTHROPIC_API_KEY is not set")
@@ -388,16 +391,25 @@ def _claude_json(system: str, user: str, label: str) -> Any:
     raw = re.sub(r"^```[a-z]*\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw)
     try:
-        return json.loads(raw)
+        result = json.loads(raw)
     except json.JSONDecodeError as exc:
         logger.error("Claude [%s] invalid JSON: %s", label, raw[:500])
         raise ValueError(f"Claude [{label}] invalid JSON: {exc}") from exc
+    logger.info("Claude [%s] done — sleeping %ds to respect rate limit…", label, _CLAUDE_RATE_LIMIT_SLEEP)
+    time.sleep(_CLAUDE_RATE_LIMIT_SLEEP)
+    return result
 
+
+_EXCERPT_MAX_CHARS = 2000   # max characters per theme excerpt sent to Claude
 
 def _excerpt(theme: dict[str, Any], words: list[Word]) -> str:
-    """Return a timestamped transcript string for the words inside a theme window."""
+    """Return a timestamped transcript string for the words inside a theme window,
+    truncated to _EXCERPT_MAX_CHARS characters."""
     theme_words = [w for w in words if theme["start"] <= w.start <= theme["end"]]
-    return words_to_transcript_text(theme_words)
+    text = words_to_transcript_text(theme_words)
+    if len(text) > _EXCERPT_MAX_CHARS:
+        text = text[:_EXCERPT_MAX_CHARS] + "…"
+    return text
 
 
 # Step 1 ─────────────────────────────────────────────────────────────────────
