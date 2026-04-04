@@ -102,10 +102,40 @@ CLIP_MAX_DURATION = 90   # seconds
 # Claude prompt
 # ---------------------------------------------------------------------------
 
+THEME_SYSTEM_PROMPT = """\
+You are an expert content analyst specializing in French business and \
+entrepreneurship interviews. Your job is to segment a long interview transcript \
+into distinct topics or themes.
+
+Identify between 10 and 20 clearly distinct themes or topics discussed in the \
+interview, with accurate start and end timestamps.
+
+Rules:
+- Each theme must be a coherent, standalone topic (not just a sentence)
+- Themes must be non-overlapping and together cover the full interview
+- Provide a short French label (≤ 8 words) and a one-sentence description for each
+
+OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
+{
+  "themes": [
+    {
+      "start": <float seconds>,
+      "end": <float seconds>,
+      "theme": "<short French label>",
+      "description": "<one sentence about this theme>"
+    }
+  ]
+}
+"""
+
 CLIP_SYSTEM_PROMPT = """\
 You are an expert short-form video editor specializing in French business and \
 entrepreneurship content. Your job is to extract the most viral, engaging clips \
 from a long interview transcript.
+
+You will receive a list of pre-identified themes with their timestamps, followed \
+by the full transcript. Select the single best clip for each theme — one clip \
+per theme, maximum 16 clips total.
 
 SELECTION CRITERIA:
 - Strong hook in the first 5 seconds (surprising stat, provocative question, \
@@ -114,6 +144,7 @@ SELECTION CRITERIA:
 - Emotional resonance: curiosity, admiration, controversy, or humor
 - French-speaking audience: relate to French/European business culture
 - Ideal duration: 45–90 seconds (never under 30s, never over 90s)
+- The clip must fall within the timestamp range of its theme
 
 VIRAL HOOK REFERENCE EXAMPLES (study these patterns):
 - "Embaucher ma femme c'est une bonne idée ?" — mundane decision reframed as \
@@ -126,8 +157,8 @@ VIRAL HOOK REFERENCE EXAMPLES (study these patterns):
 - "Vous ne payez pas assez votre comptable" — direct challenge
 - "Il n'a pas le choix, il doit vendre sa voiture" — dramatic consequence
 
-CLIP COUNT HARD LIMIT: Never generate more than 16 clips regardless of video \
-length. Always select the 16 strongest only. Quality over quantity.
+CLIP COUNT HARD LIMIT: One clip per theme, never more than 16 clips total. \
+Quality over quantity — skip a theme if it has no strong viral moment.
 
 OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 {
@@ -293,19 +324,65 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
 
 
 # ---------------------------------------------------------------------------
-# 3. Claude clip selection
+# 3. Claude thematic segmentation + clip selection
 # ---------------------------------------------------------------------------
+
+def segment_themes_with_claude(words: list[Word]) -> list[dict[str, Any]]:
+    """
+    Send the full transcript to Claude and return a list of theme dicts:
+    [{start, end, theme, description}, ...]
+    Between 10 and 20 themes.
+    """
+    transcript_text = words_to_transcript_text(words)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise EnvironmentError("ANTHROPIC_API_KEY is not set")
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    logger.info("Sending transcript to Claude for thematic segmentation…")
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        system=THEME_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": transcript_text}],
+    )
+
+    raw = message.content[0].text.strip()
+    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.error("Claude returned invalid JSON for themes: %s", raw[:500])
+        raise ValueError(f"Claude returned invalid JSON for themes: {exc}") from exc
+
+    themes = data.get("themes", [])
+    logger.info("Claude identified %d themes", len(themes))
+    return themes
+
 
 def select_clips_with_claude(
     words: list[Word],
     project_id: str,
+    themes: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Send the transcript to Claude and return a list of clip dicts:
-    [{start, end, title, hook}, ...]
-    Max 16 clips.
+    Send the transcript (and optional themes) to Claude and return a list of
+    clip dicts: [{start, end, title, hook}, ...]
+    One clip per theme, max 16 clips.
     """
     transcript_text = words_to_transcript_text(words)
+
+    if themes:
+        themes_block = "THEMES IDENTIFIED IN THIS INTERVIEW:\n" + json.dumps(
+            themes, ensure_ascii=False, indent=2
+        ) + "\n\nFULL TRANSCRIPT:\n"
+        user_content = themes_block + transcript_text
+    else:
+        user_content = transcript_text
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -318,7 +395,7 @@ def select_clips_with_claude(
         model="claude-sonnet-4-20250514",
         max_tokens=4096,
         system=CLIP_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": transcript_text}],
+        messages=[{"role": "user", "content": user_content}],
     )
 
     raw = message.content[0].text.strip()
@@ -1054,14 +1131,26 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
             logger.info("Transcript persisted to DB OK")
 
             # ----------------------------------------------------------------
-            # Step 2: Select clips with Claude
+            # Step 2a: Thematic segmentation with Claude
+            # ----------------------------------------------------------------
+            logger.info("Updating progress to segmenting_themes…")
+            await set_progress("segmenting_themes", 15, "Analyse thématique en cours…")
+            logger.info("set_progress OK — calling Claude for thematic segmentation…")
+
+            themes = await asyncio.get_event_loop().run_in_executor(
+                None, segment_themes_with_claude, words
+            )
+            logger.info("Claude identified %d themes", len(themes))
+
+            # ----------------------------------------------------------------
+            # Step 2b: Select clips with Claude (one per theme)
             # ----------------------------------------------------------------
             logger.info("Updating progress to selecting_clips…")
             await set_progress("selecting_clips", 25, "Sélection des meilleurs clips…")
             logger.info("set_progress OK — calling Claude for clip selection…")
 
             raw_clips = await asyncio.get_event_loop().run_in_executor(
-                None, select_clips_with_claude, words, project_id
+                None, select_clips_with_claude, words, project_id, themes
             )
             logger.info("Claude returned %d raw clips", len(raw_clips) if raw_clips else 0)
             if not raw_clips:
