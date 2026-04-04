@@ -110,13 +110,18 @@ CLIP_MAX_DURATION = 90   # seconds
 THEME_SYSTEM_PROMPT = """\
 You are an expert content analyst specializing in French business and \
 entrepreneurship interviews. Your job is to segment a long interview transcript \
-into distinct topics or themes.
+into the maximum number of distinct, standalone themes.
 
-Identify between 10 and 20 clearly distinct themes or topics discussed in the \
-interview, with accurate start and end timestamps.
+You MUST return between 12 and 18 themes. If you find fewer than 12, you are \
+being too coarse — split larger sections further. A 60-minute interview should \
+yield at least 15 themes.
 
 Rules:
-- Each theme must be a coherent, standalone topic (not just a sentence)
+- MINIMUM 12 themes, target 15–18. Never return fewer than 12.
+- Each theme is a distinct topic, story, opinion, or moment that could stand \
+  alone as a short clip — a question answered, an anecdote told, a claim made
+- Themes can be as short as 30 seconds. Do NOT require themes to be long.
+- Do NOT merge two different topics just because they appear close together
 - Themes must be non-overlapping and together cover the full interview
 - Provide a short French label (≤ 8 words) and a one-sentence description for each
 
@@ -162,8 +167,8 @@ OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 BOUNDARY_PROMPT = """\
 You are a precision video editor for French short-form business content.
 
-You will receive transcript excerpts, one per theme. For each theme find the \
-single best clip:
+You will receive transcript excerpts, one per theme. For each theme find AT MOST \
+2 clips (1 is fine, 0 if nothing works). Never return more than 2 clips per theme.
 
 START RULES — the hook must open on:
 - A surprising stat, bold claim, provocative question, or mid-tension moment
@@ -175,8 +180,7 @@ END RULES — cut immediately after:
 - The key insight or punchline lands
 - Before the speaker pivots to explanation, context, or a new point
 
-DURATION: 45–90 seconds. Reject any moment where no 30–90s window exists \
-and return nothing for that theme.
+DURATION: 30–90 seconds. Skip any theme where no 30–90s window exists.
 
 VIRAL HOOK TITLE EXAMPLES:
 - "Embaucher ma femme c'est une bonne idée ?"
@@ -447,12 +451,27 @@ def _excerpt(theme: dict[str, Any], words: list[Word]) -> str:
 def segment_themes_with_claude(words: list[Word]) -> list[dict[str, Any]]:
     """
     Step 1 — Thematic segmentation.
-    Returns [{start, end, theme, description}, ...] (10–20 entries).
+    Returns [{start, end, theme, description}, ...] (12–18 entries).
     """
-    logger.info("Step 1/5 — thematic segmentation…")
+    logger.info("Step 1 — thematic segmentation…")
     data = _claude_json(THEME_SYSTEM_PROMPT, words_to_transcript_text(words), "segmentation")
     themes = data.get("themes", [])
-    logger.info("  → %d themes identified", len(themes))
+    logger.info(
+        "  → %d themes returned by Claude:%s",
+        len(themes),
+        "".join(
+            f"\n    [{i+1:2d}] {t.get('theme','?')!r:50s} "
+            f"{t.get('start',0):.1f}s–{t.get('end',0):.1f}s "
+            f"({t.get('end',0)-t.get('start',0):.0f}s)"
+            for i, t in enumerate(themes)
+        ),
+    )
+    if len(themes) < 12:
+        logger.warning(
+            "  !! Claude returned only %d themes (expected ≥ 12). "
+            "Consider re-running or adjusting the prompt.",
+            len(themes),
+        )
     return themes
 
 
@@ -521,10 +540,26 @@ def find_clip_boundaries_with_claude(
 
     data = _claude_json(BOUNDARY_PROMPT, user_msg, "boundaries")
     raw_clips = data.get("clips", [])
+    logger.info("  Claude returned %d raw clips for %d themes", len(raw_clips), len(themes))
+
+    # Enforce max 2 clips per theme at the code level
+    clips_per_theme: dict[str, int] = {}
+    capped: list[dict[str, Any]] = []
+    for c in raw_clips:
+        theme_label = c.get("theme", "")
+        count = clips_per_theme.get(theme_label, 0)
+        if count >= 2:
+            logger.info(
+                "  Clip '%s' dropped — theme '%s' already has 2 clips",
+                c.get("title", "?"), theme_label,
+            )
+            continue
+        clips_per_theme[theme_label] = count + 1
+        capped.append(c)
 
     # Validate duration constraints and snap start to first spoken word
     valid: list[dict[str, Any]] = []
-    for c in raw_clips:
+    for c in capped:
         start = float(c.get("start", 0))
         end = float(c.get("end", 0))
 
