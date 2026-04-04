@@ -57,6 +57,7 @@ MAX_TITLE_W = FRAME_W - SAFE_MARGIN * 2   # 1000 px
 SUB_FONT = "Arial-Bold"
 SUB_FONTSIZE = 52
 SUB_BORDER_W = 2          # thin black outline
+SUB_BOX_BORDER = 8        # padding around subtitle background box (px)
 SUB_Y_RATIO = 0.72        # vertical position as fraction of frame height
 SUB_SHIFT_MS = 0.100      # shift card 100 ms earlier than word start
 SUB_SILENCE_GAP = 0.3     # gap in seconds that means silence (no card)
@@ -446,7 +447,7 @@ def filter_themes_with_claude(
 ) -> list[dict[str, Any]]:
     """
     Step 2 — First filter: score each theme for viral/business value (1–10).
-    Keep only themes scoring ≥ 7.
+    Keep only themes scoring ≥ 4.
     """
     logger.info("Step 2/5 — scoring %d themes…", len(themes))
 
@@ -464,12 +465,19 @@ def filter_themes_with_claude(
     data = _claude_json(THEME_FILTER_PROMPT, user_msg, "theme-filter")
     scores = {s["theme"]: s["score"] for s in data.get("scores", [])}
 
-    kept = [t for t in themes if scores.get(t["theme"], 0) >= 5]
+    kept = [t for t in themes if scores.get(t["theme"], 0) >= 4]
+    dropped = [t for t in themes if scores.get(t["theme"], 0) < 4]
     logger.info(
-        "  → %d/%d themes kept (score ≥ 5): %s",
+        "  → %d/%d themes kept (score ≥ 4): %s",
         len(kept), len(themes),
         [f'{t["theme"]}({scores.get(t["theme"], "?")})' for t in kept],
     )
+    if dropped:
+        logger.info(
+            "  → %d themes dropped (score < 4): %s",
+            len(dropped),
+            [f'{t["theme"]}({scores.get(t["theme"], "?")})' for t in dropped],
+        )
     return kept
 
 
@@ -619,12 +627,19 @@ def filter_clips_with_claude(
     data = _claude_json(FINAL_FILTER_PROMPT, user_msg, "final-filter")
     scores = {s["title"]: s["score"] for s in data.get("scores", [])}
 
-    survivors = [c for c in clips if scores.get(c.get("title", ""), 0) >= 5]
+    survivors = [c for c in clips if scores.get(c.get("title", ""), 0) >= 4]
+    dropped = [c for c in clips if scores.get(c.get("title", ""), 0) < 4]
     logger.info(
-        "  → %d/%d clips survived final filter (score ≥ 5): %s",
+        "  → %d/%d clips survived final filter (score ≥ 4): %s",
         len(survivors), len(clips),
         [f'{c.get("title", "?")}({scores.get(c.get("title", ""), "?")})' for c in survivors],
     )
+    if dropped:
+        logger.info(
+            "  → %d clips dropped (score < 4): %s",
+            len(dropped),
+            [f'{c.get("title", "?")}({scores.get(c.get("title", ""), "?")})' for c in dropped],
+        )
     return survivors
 
 
