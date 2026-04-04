@@ -107,14 +107,39 @@ CLIP_MAX_DURATION = 90   # seconds
 # Claude prompt
 # ---------------------------------------------------------------------------
 
-SELECT_CLIPS_PROMPT = """\
-You are an expert short-form video editor for French business and entrepreneurship \
-interviews. Your job is to find the best clips directly from a full transcript.
+SEGMENT_PROMPT = """\
+You are an expert content analyst for French business and entrepreneurship interviews. \
+Segment the transcript into 15–20 distinct themes.
 
-You MUST return between 10 and 14 clips. Scan the entire transcript and pick the \
-moments with the highest standalone value.
+Rules:
+- You MUST return at least 15 themes. If you find fewer you are being too coarse — \
+  split sections further. A 60-minute interview has at least 18 distinct moments.
+- Each theme is one topic, story, opinion, or standalone moment (question answered, \
+  anecdote told, claim made, number revealed).
+- Themes can be as short as 30 seconds. Do NOT merge adjacent distinct topics.
+- Themes must be non-overlapping and together cover the full interview.
+- Provide a short French label (≤ 8 words) and a one-sentence description.
 
-START RULES — every clip must open on:
+OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
+{
+  "themes": [
+    {
+      "start": <float seconds>,
+      "end": <float seconds>,
+      "theme": "<short French label>",
+      "description": "<one sentence>"
+    }
+  ]
+}
+"""
+
+BOUNDARY_PROMPT = """\
+You are a precision video editor for French short-form business content.
+
+You will receive transcript excerpts, one per theme. For EACH theme find exactly \
+ONE best clip (or zero if the theme has no strong hook moment).
+
+START RULES — the clip must open on:
 - A surprising stat, bold claim, provocative question, or mid-tension moment
 - The exact word where the tension or insight begins
 - NEVER a greeting, filler phrase ("donc", "voilà", "eh bien"), or scene-setting \
@@ -122,13 +147,9 @@ START RULES — every clip must open on:
 
 END RULES — cut immediately after:
 - The key insight or punchline lands
-- Before the speaker pivots to explanation, context, or a new topic
+- Before the speaker pivots to explanation, context, or a new point
 
-DURATION: each clip must be 30–90 seconds. Skip any moment where no 30–90s \
-window of standalone value exists.
-
-DIVERSITY: clips must cover different topics/moments — no two clips from the same \
-story or discussion thread.
+DURATION: 30–90 seconds. Return nothing for a theme if no 30–90s window works.
 
 VIRAL HOOK TITLE EXAMPLES:
 - "Embaucher ma femme c'est une bonne idée ?"
@@ -141,6 +162,7 @@ OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 {
   "clips": [
     {
+      "theme": "<exact theme label as provided>",
       "start": <float seconds>,
       "end": <float seconds>,
       "title": "<French hook title, max 60 chars>",
@@ -354,25 +376,78 @@ def _claude_json(system: str, user: str, label: str) -> Any:
     return result
 
 
-def select_clips_with_claude(words: list[Word]) -> list[dict[str, Any]]:
+def segment_themes_with_claude(words: list[Word]) -> list[dict[str, Any]]:
     """
-    Single-pass clip selection: sends the full transcript to Claude and asks
-    for 10–14 clips directly.
-    Returns [{start, end, title, hook}, ...] after duration validation and
-    hook-snapping to the first spoken word.
+    Step 1 — Thematic segmentation.
+    Returns [{start, end, theme, description}, ...] (15–20 entries).
     """
-    logger.info("Clip selection — sending full transcript to Claude…")
-    transcript = words_to_transcript_text(words)
-    data = _claude_json(SELECT_CLIPS_PROMPT, transcript, "select-clips")
+    logger.info("Step 1 — thematic segmentation…")
+    data = _claude_json(SEGMENT_PROMPT, words_to_transcript_text(words), "segmentation")
+    themes = data.get("themes", [])
+    logger.info(
+        "  Found %d themes:%s",
+        len(themes),
+        "".join(
+            f"\n    [{i+1:2d}] {t.get('theme', '?')!r:50s} "
+            f"{t.get('start', 0):.1f}s–{t.get('end', 0):.1f}s "
+            f"({t.get('end', 0) - t.get('start', 0):.0f}s)"
+            for i, t in enumerate(themes)
+        ),
+    )
+    if len(themes) < 15:
+        logger.warning(
+            "  !! Only %d themes returned (expected ≥ 15). Consider re-running.", len(themes)
+        )
+    return themes
+
+
+def find_clip_boundaries_with_claude(
+    themes: list[dict[str, Any]],
+    words: list[Word],
+) -> list[dict[str, Any]]:
+    """
+    Step 2 — For each theme find the single best clip (or none).
+    Returns [{theme, start, end, title, hook}, ...] after duration validation
+    and hook-snapping to the first spoken word.
+    """
+    logger.info("Step 2 — finding clip boundaries for %d themes…", len(themes))
+
+    _EXCERPT_MAX_CHARS = 2000
+    parts: list[str] = []
+    for t in themes:
+        theme_words = [w for w in words if t["start"] <= w.start <= t["end"]]
+        excerpt = words_to_transcript_text(theme_words)
+        if len(excerpt) > _EXCERPT_MAX_CHARS:
+            excerpt = excerpt[:_EXCERPT_MAX_CHARS] + "…"
+        parts.append(
+            f'Theme: "{t["theme"]}" [{t["start"]:.1f}s–{t["end"]:.1f}s]\n{excerpt}'
+        )
+    user_msg = "\n\n---\n\n".join(parts)
+
+    data = _claude_json(BOUNDARY_PROMPT, user_msg, "boundaries")
     raw_clips = data.get("clips", [])
-    logger.info("  Claude returned %d raw clips", len(raw_clips))
+    logger.info("  Claude returned %d raw clips for %d themes", len(raw_clips), len(themes))
+
+    # Enforce one clip per theme at the code level
+    seen_themes: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for c in raw_clips:
+        label = c.get("theme", "")
+        if label in seen_themes:
+            logger.info(
+                "  Clip '%s' dropped — theme '%s' already has a clip",
+                c.get("title", "?"), label,
+            )
+            continue
+        seen_themes.add(label)
+        deduped.append(c)
 
     valid: list[dict[str, Any]] = []
-    for c in raw_clips:
+    for c in deduped:
         start = float(c.get("start", 0))
         end = float(c.get("end", 0))
 
-        # Snap start forward to the first spoken word to avoid opening on silence
+        # Snap start to first spoken word to avoid opening on silence
         first_word = next((w for w in words if w.start >= start and w.start <= end), None)
         if first_word and first_word.start > start:
             logger.info(
@@ -392,14 +467,10 @@ def select_clips_with_claude(words: list[Word]) -> list[dict[str, Any]]:
         valid.append(c)
 
     logger.info(
-        "  → %d/%d clips valid after duration check: %s",
-        len(valid), len(raw_clips),
-        [f'"{c.get("title","?")}" ({float(c["end"])-float(c["start"]):.0f}s)' for c in valid],
+        "  Generated %d clips from %d themes: %s",
+        len(valid), len(themes),
+        [f'"{c.get("title", "?")}" ({float(c["end"]) - float(c["start"]):.0f}s)' for c in valid],
     )
-    if len(valid) < 10:
-        logger.warning(
-            "  !! Only %d clips returned (expected 10–14). Consider re-running.", len(valid)
-        )
     return valid
 
 
@@ -1165,21 +1236,35 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
             logger.info("Transcript persisted to DB OK")
 
             # ----------------------------------------------------------------
-            # Step 2: Single-pass clip selection
+            # Step 2: Thematic segmentation
             # ----------------------------------------------------------------
-            await set_progress("selecting_clips", 12, "Sélection des clips…")
-            raw_clips = await asyncio.get_event_loop().run_in_executor(
-                None, select_clips_with_claude, words
+            await set_progress("segmenting_themes", 12, "Segmentation thématique…")
+            themes = await asyncio.get_event_loop().run_in_executor(
+                None, segment_themes_with_claude, words
             )
-            if not raw_clips:
-                await set_progress("error", 0, "Aucun clip sélectionné.", status="error")
+            if not themes:
+                await set_progress("error", 0, "Aucun thème identifié.", status="error")
                 return
 
             # ----------------------------------------------------------------
-            # Step 2b: Internal silence trimming (no API call)
+            # Step 3: Clip boundaries — one best clip per theme
+            # ----------------------------------------------------------------
+            await set_progress("finding_boundaries", 20, "Recherche des moments clés…")
+            raw_clips = await asyncio.get_event_loop().run_in_executor(
+                None, find_clip_boundaries_with_claude, themes, words
+            )
+            logger.info(
+                "Found %d themes, generated %d clips", len(themes), len(raw_clips)
+            )
+            if not raw_clips:
+                await set_progress("error", 0, "Aucune limite de clip trouvée.", status="error")
+                return
+
+            # ----------------------------------------------------------------
+            # Step 4: Internal silence trimming (no API call)
             # ----------------------------------------------------------------
             raw_clips = trim_clip_silences(raw_clips, words)
-            logger.info("Pipeline clip selection complete — %d clips", len(raw_clips))
+            logger.info("Pipeline complete — %d clips after silence trimming", len(raw_clips))
             if not raw_clips:
                 await set_progress("error", 0, "Tous les clips supprimés au trimming.", status="error")
                 return
