@@ -61,6 +61,9 @@ SUB_BOX_BORDER = 8        # padding around subtitle background box (px)
 SUB_Y_RATIO = 0.72        # vertical position as fraction of frame height
 SUB_SHIFT_MS = 0.100      # shift card 100 ms earlier than word start
 SUB_SILENCE_GAP = 0.3     # gap in seconds that means silence (no card)
+SUB_MIN_CARD_GAP = 0.05   # minimum gap enforced between consecutive subtitle cards
+
+_FILLER_WORDS = {"hm", "hum", "euh", "eh", "mmm", "ah"}  # isolated filler sounds to suppress
 
 # Set False to skip all drawtext rendering (subtitles + title card).
 # Disable while debugging FFmpeg filter parse errors; re-enable once rendering works.
@@ -341,12 +344,19 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
     Group words into 2–3 word cards with precise display timing.
 
     Rules:
+    - Filler words (_FILLER_WORDS) are stripped before grouping
     - 2–3 words per card
     - Card appears SUB_SHIFT_MS before the first word starts
     - Card disappears exactly when the last word ends
     - Never bridge a silence gap > SUB_SILENCE_GAP seconds
+    - A minimum gap of SUB_MIN_CARD_GAP is enforced between consecutive cards
     - Timestamps are relative to clip_start (i.e. 0 = start of clip)
     """
+    if not words:
+        return []
+
+    # Strip isolated filler sounds so they never appear as subtitles
+    words = [w for w in words if w.text.strip().lower() not in _FILLER_WORDS]
     if not words:
         return []
 
@@ -364,7 +374,7 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
             display_end=raw_end,
         ))
 
-    for i, word in enumerate(words):
+    for word in words:
         if group:
             gap = word.start - group[-1].end
             if gap > SUB_SILENCE_GAP:
@@ -379,6 +389,13 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
             group = []
 
     flush(group)
+
+    # Enforce minimum gap between consecutive cards to prevent overlap
+    for i in range(1, len(cards)):
+        min_start = cards[i - 1].display_end + SUB_MIN_CARD_GAP
+        if cards[i].display_start < min_start:
+            cards[i].display_start = min_start
+
     return cards
 
 
@@ -1354,20 +1371,9 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                 return
 
             # ----------------------------------------------------------------
-            # Step 2b: First filter — score themes, keep ≥ 7/10
+            # Step 2b: Clip boundaries — exact hook start + insight end
             # ----------------------------------------------------------------
-            await set_progress("filtering_themes", 18, "Filtrage des thèmes…")
-            themes = await asyncio.get_event_loop().run_in_executor(
-                None, filter_themes_with_claude, themes, words
-            )
-            if not themes:
-                await set_progress("error", 0, "Aucun thème retenu après filtrage.", status="error")
-                return
-
-            # ----------------------------------------------------------------
-            # Step 2c: Clip boundaries — exact hook start + insight end
-            # ----------------------------------------------------------------
-            await set_progress("finding_boundaries", 24, "Recherche des moments clés…")
+            await set_progress("finding_boundaries", 20, "Recherche des moments clés…")
             raw_clips = await asyncio.get_event_loop().run_in_executor(
                 None, find_clip_boundaries_with_claude, themes, words
             )
@@ -1376,23 +1382,12 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                 return
 
             # ----------------------------------------------------------------
-            # Step 2d: Internal silence trimming (no API call)
+            # Step 2c: Internal silence trimming (no API call)
             # ----------------------------------------------------------------
             raw_clips = trim_clip_silences(raw_clips, words)
-            if not raw_clips:
-                await set_progress("error", 0, "Tous les clips supprimés au trimming.", status="error")
-                return
-
-            # ----------------------------------------------------------------
-            # Step 2e: Final filter — scroll-stopping review
-            # ----------------------------------------------------------------
-            await set_progress("final_filter", 30, "Filtre final de qualité…")
-            raw_clips = await asyncio.get_event_loop().run_in_executor(
-                None, filter_clips_with_claude, raw_clips, words
-            )
             logger.info("Pipeline clip selection complete — %d clips", len(raw_clips))
             if not raw_clips:
-                await set_progress("error", 0, "Aucun clip retenu après filtre final.", status="error")
+                await set_progress("error", 0, "Tous les clips supprimés au trimming.", status="error")
                 return
 
             # ----------------------------------------------------------------
