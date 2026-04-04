@@ -497,11 +497,23 @@ def find_clip_boundaries_with_claude(
     data = _claude_json(BOUNDARY_PROMPT, user_msg, "boundaries")
     raw_clips = data.get("clips", [])
 
-    # Validate duration constraints
+    # Validate duration constraints and snap start to first spoken word
     valid: list[dict[str, Any]] = []
     for c in raw_clips:
         start = float(c.get("start", 0))
         end = float(c.get("end", 0))
+
+        # Snap start forward to the first word that begins at or after Claude's
+        # suggested start, so the clip never opens on silence.
+        first_word = next((w for w in words if w.start >= start and w.start <= end), None)
+        if first_word and first_word.start > start:
+            logger.info(
+                "  Clip '%s': snapping start %.3fs → %.3fs (%.2fs silence removed)",
+                c.get("title", "?"), start, first_word.start, first_word.start - start,
+            )
+            start = first_word.start
+            c = {**c, "start": start}
+
         duration = end - start
         if duration < CLIP_MIN_DURATION or duration > CLIP_MAX_DURATION:
             logger.warning(
@@ -534,12 +546,14 @@ def trim_clip_silences(
     trimmed: list[dict[str, Any]] = []
 
     for c in clips:
+        title = c.get("title", "?")
+        logger.info("  Trimming silences for clip '%s'…", title)
         start = float(c["start"])
         end = float(c["end"])
         clip_words = [w for w in words if start <= w.start <= end]
 
         if not clip_words:
-            logger.warning("  Clip '%s' has no words — dropping", c.get("title", "?"))
+            logger.warning("  Clip '%s' has no words — dropping", title)
             continue
 
         new_start = start
