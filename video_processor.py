@@ -196,26 +196,29 @@ OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 """
 
 FINAL_FILTER_PROMPT = """\
-You are a ruthless short-form video editor for French business content.
+You are a short-form video editor for French business content.
 
 You will receive a set of proposed clips — each with its title, hook sentence, \
-and opening transcript lines. Keep ONLY the clips that would genuinely stop a \
-scroll on TikTok, Instagram Reels, or YouTube Shorts for a French business audience.
+and opening transcript lines. Score each clip from 1 to 10 based on how likely \
+it is to stop a scroll on TikTok, Instagram Reels, or YouTube Shorts for a \
+French business audience.
 
-REMOVE a clip if any of these are true:
-- The opening line is weak (greeting, transition, or generic statement)
-- The title fails to create curiosity or tension
-- The content is too generic — advice anyone could give
-- It is too similar to a stronger clip already in the list
-
-KEEP a clip only if ALL of these are true:
-- The first sentence grabs immediately
-- The title creates irresistible curiosity or a strong emotion
-- The content is specific, surprising, or emotionally resonant
+SCORING GUIDE:
+- 9–10: Irresistible — gripping opening, title creates strong curiosity or emotion, \
+  content is specific and surprising
+- 7–8: Strong — good hook, clear value, memorable angle
+- 5–6: Decent — watchable but not exceptional
+- 1–4: Weak — generic opening, dull title, or too similar to a stronger clip
 
 OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 {
-  "keep": ["<exact title 1>", "<exact title 2>", ...]
+  "scores": [
+    {
+      "title": "<exact title as provided>",
+      "score": <integer 1-10>,
+      "reason": "<one sentence>"
+    }
+  ]
 }
 """
 
@@ -452,9 +455,9 @@ def filter_themes_with_claude(
     data = _claude_json(THEME_FILTER_PROMPT, user_msg, "theme-filter")
     scores = {s["theme"]: s["score"] for s in data.get("scores", [])}
 
-    kept = [t for t in themes if scores.get(t["theme"], 0) >= 7]
+    kept = [t for t in themes if scores.get(t["theme"], 0) >= 5]
     logger.info(
-        "  → %d/%d themes kept (score ≥ 7): %s",
+        "  → %d/%d themes kept (score ≥ 5): %s",
         len(kept), len(themes),
         [f'{t["theme"]}({scores.get(t["theme"], "?")})' for t in kept],
     )
@@ -591,12 +594,13 @@ def filter_clips_with_claude(
     user_msg = "CLIPS TO REVIEW:\n\n" + "\n\n---\n\n".join(parts)
 
     data = _claude_json(FINAL_FILTER_PROMPT, user_msg, "final-filter")
-    keep_titles = set(data.get("keep", []))
+    scores = {s["title"]: s["score"] for s in data.get("scores", [])}
 
-    survivors = [c for c in clips if c.get("title", "") in keep_titles]
+    survivors = [c for c in clips if scores.get(c.get("title", ""), 0) >= 5]
     logger.info(
-        "  → %d/%d clips survived final filter",
+        "  → %d/%d clips survived final filter (score ≥ 5): %s",
         len(survivors), len(clips),
+        [f'{c.get("title", "?")}({scores.get(c.get("title", ""), "?")})' for c in survivors],
     )
     return survivors
 
