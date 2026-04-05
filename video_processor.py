@@ -525,7 +525,7 @@ def find_clip_boundaries_with_claude(
 
 _SILENCE_TRIM_THRESHOLD = 0.8   # seconds
 
-_TRIM_FILLER_WORDS = {"euh", "hm", "hmm", "mmm", "bah", "ben", "voilà"}
+_TRIM_FILLER_WORDS = {"euh", "heum", "hm", "hmm", "mmm", "bah", "ben", "voilà"}
 
 
 def _remap_words_to_output(
@@ -575,11 +575,17 @@ def trim_clip_silences(
         end = float(c["end"])
 
         # Build word list for this clip, stripping isolated filler words
+        all_clip_words = [w for w in words if start <= w.start <= end]
         clip_words = [
-            w for w in words
-            if start <= w.start <= end
-            and w.text.lower().strip(".,!?…") not in _TRIM_FILLER_WORDS
+            w for w in all_clip_words
+            if w.text.lower().strip(".,!?…") not in _TRIM_FILLER_WORDS
         ]
+        n_fillers = len(all_clip_words) - len(clip_words)
+        if n_fillers:
+            logger.info("  Clip '%s' — removed %d filler word(s): %s",
+                        title, n_fillers,
+                        [w.text for w in all_clip_words
+                         if w.text.lower().strip(".,!?…") in _TRIM_FILLER_WORDS])
 
         if not clip_words:
             logger.warning("  Clip '%s' has no words after filler removal — dropping", title)
@@ -944,13 +950,59 @@ def build_subtitle_filters(cards: list[SubtitleCard]) -> list[str]:
 # 8. Music selection
 # ---------------------------------------------------------------------------
 
-def pick_music_track() -> str | None:
-    """Return a random .mp3 from the music directory, or None if empty."""
+_HIGH_ENERGY_CONTENT = {
+    "esclave", "libre", "problème", "choc", "shocking", "dette", "ruine",
+    "trap", "piège", "urgent", "alerte", "vrai", "menteur", "arnaque",
+}
+_EMOTIONAL_CONTENT = {
+    "dormais", "sacrifice", "famille", "survivre", "loyer", "vie", "rêve",
+    "histoire", "témoignage", "vécu", "amour", "larmes", "difficile",
+}
+_HIGH_ENERGY_TRACK = {"trap", "bass", "dark", "hard"}
+_EMOTIONAL_TRACK = {"slowed", "reverb", "chill", "ethereal"}
+
+
+def _classify_clip_energy(title: str, hook: str) -> str:
+    """Return 'high', 'emotional', or 'default' based on title and hook text."""
+    combined = (title + " " + hook).lower()
+    # Shocking stat signals: large numbers, percentages, currency amounts
+    if any(tok in combined for tok in ("000", "€", "%", "100%", "million", "milliard")):
+        return "high"
+    words_in_text = set(combined.split())
+    if words_in_text & _HIGH_ENERGY_CONTENT:
+        return "high"
+    if words_in_text & _EMOTIONAL_CONTENT:
+        return "emotional"
+    return "default"
+
+
+def pick_music_track(title: str = "", hook: str = "") -> str | None:
+    """Return a .mp3 matched to the clip's energy level, or None if no tracks."""
     tracks = list(MUSIC_DIR.glob("*.mp3"))
     if not tracks:
         logger.warning("No music tracks found in %s", MUSIC_DIR)
         return None
-    return str(random.choice(tracks))
+
+    energy = _classify_clip_energy(title, hook)
+
+    def _keywords_in_name(path: Path, keywords: set[str]) -> bool:
+        return any(k in path.stem.lower() for k in keywords)
+
+    if energy == "high":
+        preferred = [t for t in tracks if _keywords_in_name(t, _HIGH_ENERGY_TRACK)]
+        reason = "high-energy clip → prefer trap/bass/dark/hard tracks"
+    elif energy == "emotional":
+        preferred = [t for t in tracks if _keywords_in_name(t, _EMOTIONAL_TRACK)]
+        reason = "emotional/story clip → prefer slowed/reverb/chill/ethereal tracks"
+    else:
+        preferred = []
+        reason = "default energy → random track"
+
+    pool = preferred if preferred else tracks
+    chosen = random.choice(pool)
+    logger.info("Music selection — energy=%s, reason=%s, track=%s (pool size=%d)",
+                energy, reason, chosen.name, len(pool))
+    return str(chosen)
 
 
 # ---------------------------------------------------------------------------
@@ -1184,7 +1236,7 @@ def _render_clip_sync(
             _shutil.copy2(cropped, text_burned)
 
         # --- Step E: mix background music ---
-        music_track = pick_music_track()
+        music_track = pick_music_track(title=spec.title, hook=spec.hook)
         if music_track:
             with_music = os.path.join(tmp_dir, "music.mp4")
             _run_ffmpeg([
@@ -1193,7 +1245,7 @@ def _render_clip_sync(
                 "-filter_complex",
                 (
                     "[0:a]volume=1.0[speech];"
-                    "[1:a]volume=0.12,atrim=0:duration={dur}[music];"
+                    "[1:a]volume=0.18,atrim=0:duration={dur}[music];"
                     "[speech][music]amix=inputs=2:duration=first[aout]"
                 ).format(dur=duration),
                 "-map", "0:v",
