@@ -541,36 +541,22 @@ def trim_clip_silences(
 
         new_start = start
         new_end = end
-        lead_trimmed = 0.0
-        trail_trimmed = 0.0
 
         # Trim leading silence
-        lead_gap = clip_words[0].start - start
-        if lead_gap > _SILENCE_TRIM_THRESHOLD:
+        if clip_words[0].start - start > _SILENCE_TRIM_THRESHOLD:
             new_start = clip_words[0].start
-            lead_trimmed = lead_gap
-            logger.info(
-                "  Clip '%s': trimmed leading silence %.2fs (%.1fs → %.1fs)",
-                title, lead_trimmed, start, new_start,
-            )
 
         # Trim trailing silence
-        trail_gap = end - clip_words[-1].end
-        if trail_gap > _SILENCE_TRIM_THRESHOLD:
+        if end - clip_words[-1].end > _SILENCE_TRIM_THRESHOLD:
             new_end = clip_words[-1].end + 0.3   # small breath after last word
-            trail_trimmed = end - new_end
-            logger.info(
-                "  Clip '%s': trimmed trailing silence %.2fs (%.1fs → %.1fs)",
-                title, trail_trimmed, end, new_end,
-            )
 
-        total_trimmed = lead_trimmed + trail_trimmed
-        if total_trimmed == 0.0:
-            logger.info("  Clip '%s': no silence to trim (lead=%.2fs, trail=%.2fs)",
-                        title, lead_gap, trail_gap)
-        else:
-            logger.info("  Clip '%s': total trimmed %.2fs — new duration %.1fs",
-                        title, total_trimmed, new_end - new_start)
+        before = end - start
+        after = new_end - new_start
+        removed = before - after
+        logger.info(
+            "  Trimming silences for clip '%s' — before: %.1fs, after: %.1fs, removed: %.2fs",
+            title, before, after, removed,
+        )
 
         duration = new_end - new_start
         if duration < CLIP_MIN_DURATION:
