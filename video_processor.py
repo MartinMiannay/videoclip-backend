@@ -138,8 +138,8 @@ You are a precision video editor for French short-form business content.
 
 You will receive transcript excerpts for ALL themes from an interview. \
 Select the best 12–14 clips total — one per theme, choosing the themes with \
-the strongest viral potential. Every selected theme MUST have a clip; do not \
-skip a theme you have chosen.
+the strongest viral potential. You MUST return at least 12 clips, never fewer \
+than 10. Every selected theme MUST have a clip; do not skip a theme you have chosen.
 
 START RULES — the clip must open on:
 - A surprising stat, bold claim, provocative question, or mid-tension moment
