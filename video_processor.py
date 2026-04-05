@@ -136,8 +136,10 @@ OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 BOUNDARY_PROMPT = """\
 You are a precision video editor for French short-form business content.
 
-You will receive transcript excerpts, one per theme. For EACH theme find exactly \
-ONE best clip (or zero if the theme has no strong hook moment).
+You will receive transcript excerpts for ALL themes from an interview. \
+Select the best 12–14 clips total — one per theme, choosing the themes with \
+the strongest viral potential. Every selected theme MUST have a clip; do not \
+skip a theme you have chosen.
 
 START RULES — the clip must open on:
 - A surprising stat, bold claim, provocative question, or mid-tension moment
@@ -149,7 +151,9 @@ END RULES — cut immediately after:
 - The key insight or punchline lands
 - Before the speaker pivots to explanation, context, or a new point
 
-DURATION: 30–90 seconds. Return nothing for a theme if no 30–90s window works.
+DURATION: Aim for 30–90 seconds. If the best moment for a theme is slightly \
+outside that range, include it anyway — always return the best clip for each \
+selected theme even if imperfect.
 
 VIRAL HOOK TITLE EXAMPLES:
 - "Embaucher ma femme c'est une bonne idée ?"
@@ -412,7 +416,6 @@ def segment_themes_with_claude(words: list[Word]) -> list[dict[str, Any]]:
     return themes
 
 
-_BOUNDARY_BATCH_SIZE = 5   # themes per Claude call
 _TOP_CLIPS = 14            # keep the N most viral clips
 
 
@@ -421,43 +424,27 @@ def find_clip_boundaries_with_claude(
     words: list[Word],
 ) -> list[dict[str, Any]]:
     """
-    Step 2 — For each theme find the single best clip (or none).
-    Themes are processed in batches of _BOUNDARY_BATCH_SIZE so that every
-    theme gets its own focused Claude call (avoids the model silently
-    dropping themes when given too many at once).
-    Returns the top _TOP_CLIPS clips ranked by virality_score after
+    Step 2 — Send all themes to Claude in one call and ask for the best
+    12–14 clips ranked by virality. Returns up to _TOP_CLIPS clips after
     duration validation and hook-snapping to the first spoken word.
     """
-    logger.info("Step 2 — finding clip boundaries for %d themes (batches of %d)…",
-                len(themes), _BOUNDARY_BATCH_SIZE)
+    logger.info("Step 2 — finding clip boundaries for %d themes (single call)…", len(themes))
 
     _EXCERPT_MAX_CHARS = 2000
-    all_raw_clips: list[dict[str, Any]] = []
+    parts: list[str] = []
+    for t in themes:
+        theme_words = [w for w in words if t["start"] <= w.start <= t["end"]]
+        excerpt = words_to_transcript_text(theme_words)
+        if len(excerpt) > _EXCERPT_MAX_CHARS:
+            excerpt = excerpt[:_EXCERPT_MAX_CHARS] + "…"
+        parts.append(
+            f'Theme: "{t["theme"]}" [{t["start"]:.1f}s–{t["end"]:.1f}s]\n{excerpt}'
+        )
+    user_msg = "\n\n---\n\n".join(parts)
 
-    for batch_start in range(0, len(themes), _BOUNDARY_BATCH_SIZE):
-        batch = themes[batch_start: batch_start + _BOUNDARY_BATCH_SIZE]
-        batch_num = batch_start // _BOUNDARY_BATCH_SIZE + 1
-        total_batches = (len(themes) + _BOUNDARY_BATCH_SIZE - 1) // _BOUNDARY_BATCH_SIZE
-        logger.info("  Batch %d/%d — %d themes", batch_num, total_batches, len(batch))
-
-        parts: list[str] = []
-        for t in batch:
-            theme_words = [w for w in words if t["start"] <= w.start <= t["end"]]
-            excerpt = words_to_transcript_text(theme_words)
-            if len(excerpt) > _EXCERPT_MAX_CHARS:
-                excerpt = excerpt[:_EXCERPT_MAX_CHARS] + "…"
-            parts.append(
-                f'Theme: "{t["theme"]}" [{t["start"]:.1f}s–{t["end"]:.1f}s]\n{excerpt}'
-            )
-        user_msg = "\n\n---\n\n".join(parts)
-
-        data = _claude_json(BOUNDARY_PROMPT, user_msg, f"boundaries-{batch_num}")
-        batch_clips = data.get("clips", [])
-        logger.info("  Batch %d/%d: Claude returned %d clips for %d themes",
-                    batch_num, total_batches, len(batch_clips), len(batch))
-        all_raw_clips.extend(batch_clips)
-
-    logger.info("  Total raw clips across all batches: %d", len(all_raw_clips))
+    data = _claude_json(BOUNDARY_PROMPT, user_msg, "boundaries")
+    all_raw_clips = data.get("clips", [])
+    logger.info("  Claude returned %d raw clips for %d themes", len(all_raw_clips), len(themes))
 
     # Enforce one clip per theme at the code level
     seen_themes: set[str] = set()
