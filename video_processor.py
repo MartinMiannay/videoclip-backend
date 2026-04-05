@@ -209,8 +209,16 @@ class ClipSpec:
     end: float
     title: str
     hook: str
-    words: list[Word]          # words that fall within this clip's time range
+    words: list[Word]          # words remapped to output timeline (t=0 at clip start)
     subtitle_cards: list[SubtitleCard] = field(default_factory=list)
+    # keep_segments in source-video absolute time; empty means use start/end directly
+    segments: list[tuple[float, float]] = field(default_factory=list)
+
+    @property
+    def output_duration(self) -> float:
+        if self.segments:
+            return sum(e - s for s, e in self.segments)
+        return self.end - self.start
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +514,30 @@ _SILENCE_TRIM_THRESHOLD = 0.8   # seconds
 _TRIM_FILLER_WORDS = {"euh", "hm", "hmm", "mmm", "bah", "ben", "voilà"}
 
 
+def _remap_words_to_output(
+    words: list[Word],
+    segments: list[tuple[float, float]],
+) -> list[Word]:
+    """
+    Given words with source-timeline timestamps and a list of keep segments
+    (in source time), return new Word objects whose timestamps are in the
+    output timeline (gaps removed, output starts at t=0).
+    """
+    remapped: list[Word] = []
+    output_offset = 0.0
+    for seg_start, seg_end in segments:
+        for w in words:
+            if seg_start <= w.start and w.end <= seg_end + 0.05:
+                remapped.append(Word(
+                    text=w.text,
+                    start=output_offset + (w.start - seg_start),
+                    end=output_offset + (w.end - seg_start),
+                    precise=w.precise,
+                ))
+        output_offset += seg_end - seg_start
+    return remapped
+
+
 def trim_clip_silences(
     clips: list[dict[str, Any]],
     words: list[Word],
@@ -550,23 +582,45 @@ def trim_clip_silences(
         if end - clip_words[-1].end > _SILENCE_TRIM_THRESHOLD:
             new_end = clip_words[-1].end + 0.3   # small breath after last word
 
-        before = end - start
-        after = new_end - new_start
-        removed = before - after
+        # --- Build keep-segments by scanning internal gaps ---
+        keep_segments: list[tuple[float, float]] = []
+        seg_start = new_start
+        for i in range(len(clip_words) - 1):
+            gap = clip_words[i + 1].start - clip_words[i].end
+            if gap > _SILENCE_TRIM_THRESHOLD:
+                seg_end = clip_words[i].end + 0.15  # tiny breath after word
+                keep_segments.append((seg_start, seg_end))
+                seg_start = clip_words[i + 1].start
+        keep_segments.append((seg_start, new_end))
+
+        internal_removed = sum(
+            keep_segments[i + 1][0] - keep_segments[i][1]
+            for i in range(len(keep_segments) - 1)
+        )
+        after_duration = sum(e - s for s, e in keep_segments)
+        total_removed = (end - start) - after_duration
+        edge_removed = total_removed - internal_removed
+
         logger.info(
-            "  Trimming silences for clip '%s' — before: %.1fs, after: %.1fs, removed: %.2fs",
-            title, before, after, removed,
+            "  Trimming silences for clip '%s' — before: %.1fs, after: %.1fs, removed: %.2fs"
+            " (edge: %.2fs, internal gaps: %d × %.2fs total)",
+            title, end - start, after_duration, total_removed,
+            edge_removed, len(keep_segments) - 1, internal_removed,
         )
 
-        duration = new_end - new_start
-        if duration < CLIP_MIN_DURATION:
+        if after_duration < CLIP_MIN_DURATION:
             logger.warning(
                 "  Clip '%s' dropped after silence trim — duration %.1fs < %ds",
-                title, duration, CLIP_MIN_DURATION,
+                title, after_duration, CLIP_MIN_DURATION,
             )
             continue
 
-        trimmed.append({**c, "start": new_start, "end": new_end})
+        trimmed.append({
+            **c,
+            "start": new_start,
+            "end": new_end,
+            "segments": keep_segments,
+        })
 
     logger.info("  → %d clips after silence trimming", len(trimmed))
     return trimmed
@@ -1029,23 +1083,44 @@ def _render_clip_sync(
     tmp_dir = tempfile.mkdtemp(prefix=f"clip_{spec.clip_id}_")
 
     try:
-        duration = spec.end - spec.start
+        duration = spec.output_duration
 
-        # --- Step A: trim ---
+        # --- Step A: trim (with optional internal silence concat) ---
         trimmed = os.path.join(tmp_dir, "trimmed.mp4")
-        _run_ffmpeg([
-            "-ss", str(spec.start),
-            "-to", str(spec.end),
-            "-i", source_video,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-c:a", "aac", "-b:a", "192k",
-            "-y", trimmed,
-        ], desc=f"trim {spec.clip_id}")
+        if len(spec.segments) > 1:
+            # Build filter_complex that trims each keep-segment and concatenates them
+            n = len(spec.segments)
+            filter_parts: list[str] = []
+            for i, (s, e) in enumerate(spec.segments):
+                filter_parts.append(f"[0:v]trim=start={s}:end={e},setpts=PTS-STARTPTS[v{i}]")
+                filter_parts.append(f"[0:a]atrim=start={s}:end={e},asetpts=PTS-STARTPTS[a{i}]")
+            concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(n))
+            filter_parts.append(f"{concat_inputs}concat=n={n}:v=1:a=1[v][a]")
+            logger.info("  Clip %s: concat %d segments (internal silences removed)", spec.clip_id, n)
+            _run_ffmpeg([
+                "-i", source_video,
+                "-filter_complex", ";".join(filter_parts),
+                "-map", "[v]",
+                "-map", "[a]",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-c:a", "aac", "-b:a", "192k",
+                "-y", trimmed,
+            ], desc=f"trim+concat {spec.clip_id}")
+        else:
+            _run_ffmpeg([
+                "-ss", str(spec.start),
+                "-to", str(spec.end),
+                "-i", source_video,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-c:a", "aac", "-b:a", "192k",
+                "-y", trimmed,
+            ], desc=f"trim {spec.clip_id}")
 
         # --- Step B: crop to 9:16 ---
+        # words are in output timeline (t=0 = start of trimmed clip)
         crop_filter = build_dynamic_crop_filter(
             detections, source_w, source_h,
-            spec.start, spec.end, spec.words,
+            0.0, duration, spec.words,
         )
         cropped = os.path.join(tmp_dir, "cropped.mp4")
         _run_ffmpeg([
@@ -1315,8 +1390,16 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                 cid = str(uuid.uuid4())[:8]
                 start = float(raw["start"])
                 end = float(raw["end"])
-                clip_words = [w for w in words if start <= w.start <= end]
-                cards = build_subtitle_cards(clip_words, clip_start=start)
+                segments: list[tuple[float, float]] = raw.get("segments", [])
+
+                if segments:
+                    # Words remapped to output timeline (gaps excised, t=0 at clip start)
+                    all_clip_words = [w for w in words if start <= w.start <= end]
+                    clip_words = _remap_words_to_output(all_clip_words, segments)
+                    cards = build_subtitle_cards(clip_words, clip_start=0.0)
+                else:
+                    clip_words = [w for w in words if start <= w.start <= end]
+                    cards = build_subtitle_cards(clip_words, clip_start=start)
 
                 spec = ClipSpec(
                     clip_id=cid,
@@ -1327,6 +1410,7 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                     hook=raw.get("hook", ""),
                     words=clip_words,
                     subtitle_cards=cards,
+                    segments=segments,
                 )
                 clip_specs_map[cid] = spec
                 clip_docs.append({
@@ -1335,6 +1419,7 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                     "hook": raw.get("hook", ""),
                     "start": start,
                     "end": end,
+                    "segments": [[s, e] for s, e in segments],
                     "status": "pending",
                     "storage_path": "",
                     "error": "",
@@ -1369,8 +1454,16 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                     continue
                 start = float(c["start"])
                 end = float(c["end"])
-                clip_words = [w for w in words if start <= w.start <= end]
-                cards = build_subtitle_cards(clip_words, clip_start=start)
+                segments: list[tuple[float, float]] = [
+                    (float(s), float(e)) for s, e in c.get("segments", [])
+                ]
+                if segments:
+                    all_clip_words = [w for w in words if start <= w.start <= end]
+                    clip_words = _remap_words_to_output(all_clip_words, segments)
+                    cards = build_subtitle_cards(clip_words, clip_start=0.0)
+                else:
+                    clip_words = [w for w in words if start <= w.start <= end]
+                    cards = build_subtitle_cards(clip_words, clip_start=start)
                 clip_specs_map[c["id"]] = ClipSpec(
                     clip_id=c["id"],
                     project_id=project_id,
@@ -1380,6 +1473,7 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                     hook=c.get("hook", ""),
                     words=clip_words,
                     subtitle_cards=cards,
+                    segments=segments,
                 )
 
         # ----------------------------------------------------------------
