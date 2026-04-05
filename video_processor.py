@@ -899,20 +899,67 @@ def build_title_card_filter(title: str, duration: float) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _escape_drawtext(text: str) -> str:
-    """Escape special characters for FFmpeg drawtext text option.
+    """Escape special characters for FFmpeg drawtext text= option.
 
-    Order matters: backslash first so we don't double-escape later substitutions.
-    % must be escaped as %% — FFmpeg drawtext expands %{pts} etc. at render time,
-    so a bare % (e.g. "20%") corrupts the filter string and causes cascading parse
-    failures that manifest as "Missing ')' in between(t".
+    Escape order matters — backslash must come first to avoid double-escaping.
+
+    Characters handled:
+      \\  → \\\\   (must be first)
+      %   → %%     (FFmpeg expands %{var} at render time; bare % corrupts filter)
+      '   → \u2019 (right single quotation mark — keeps text='...' delimiters intact)
+      :   → \\:    (FFmpeg option separator inside drawtext)
+      [   → \\[    (FFmpeg stream specifier syntax)
+      ]   → \\]
+      {   → \\{    (FFmpeg variable expansion: %{pts} etc.)
+      }   → \\}
+      ,   — NOT escaped (handled safely inside text='...' quotes)
     """
-    text = text.replace("\\", "\\\\")
-    text = text.replace("%", "%%")
-    text = text.replace("'", "\u2019")
-    text = text.replace(":", "\\:")
-    text = text.replace("[", "\\[")
-    text = text.replace("]", "\\]")
-    return text
+    try:
+        original = text
+        text = text.replace("\\", "\\\\")
+        text = text.replace("%", "%%")
+        text = text.replace("'", "\u2019")
+        text = text.replace(":", "\\:")
+        text = text.replace("[", "\\[")
+        text = text.replace("]", "\\]")
+        text = text.replace("{", "\\{")
+        text = text.replace("}", "\\}")
+        return text
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "_escape_drawtext failed for %r (%s) — falling back to ASCII-safe replacement",
+            original, exc,
+        )
+        # Fallback: keep only printable ASCII and basic accented Latin characters,
+        # replace everything else with a space so the card still renders.
+        safe = ""
+        for ch in original:
+            cp = ord(ch)
+            if 0x20 <= cp <= 0x7E:          # printable ASCII (space–tilde)
+                # Still escape the ASCII special chars individually
+                if ch == "%":
+                    safe += "%%"
+                elif ch == "'":
+                    safe += "\u2019"
+                elif ch == ":":
+                    safe += "\\:"
+                elif ch == "[":
+                    safe += "\\["
+                elif ch == "]":
+                    safe += "\\]"
+                elif ch == "{":
+                    safe += "\\{"
+                elif ch == "}":
+                    safe += "\\}"
+                elif ch == "\\":
+                    safe += "\\\\"
+                else:
+                    safe += ch
+            elif 0xC0 <= cp <= 0x2AF:       # Latin Extended, common accents
+                safe += ch
+            else:
+                safe += " "
+        return safe.strip() or "?"
 
 
 def build_subtitle_filters(cards: list[SubtitleCard]) -> list[str]:
@@ -920,6 +967,10 @@ def build_subtitle_filters(cards: list[SubtitleCard]) -> list[str]:
     Build FFmpeg drawtext filter fragments for all subtitle cards.
     Returns a list of individual drawtext filter strings (not joined),
     so callers can chunk them into batches before passing to FFmpeg.
+
+    Cards whose text cannot be safely escaped are replaced with a
+    sanitised version rather than skipped, so no card is ever silently
+    dropped due to special characters.
     """
     if not cards:
         return []
@@ -928,20 +979,27 @@ def build_subtitle_filters(cards: list[SubtitleCard]) -> list[str]:
     filters: list[str] = []
 
     for card in cards:
-        text = _escape_drawtext(card.text)
-        t_start = f"{card.display_start:.3f}"
-        t_end = f"{card.display_end:.3f}"
-        filters.append(
-            f"drawtext=fontfile={FONT_PATH}"
-            f":fontsize={SUB_FONTSIZE}"
-            f":fontcolor=white"
-            f":text='{text}'"
-            f":x=(w-text_w)/2"
-            f":y={sub_y}"
-            f":bordercolor=black"
-            f":borderw={SUB_BORDER_W}"
-            f":enable='between(t\\,{t_start}\\,{t_end})'"
-        )
+        try:
+            text = _escape_drawtext(card.text)
+            t_start = f"{card.display_start:.3f}"
+            t_end = f"{card.display_end:.3f}"
+            filters.append(
+                f"drawtext=fontfile={FONT_PATH}"
+                f":fontsize={SUB_FONTSIZE}"
+                f":fontcolor=white"
+                f":text='{text}'"
+                f":x=(w-text_w)/2"
+                f":y={sub_y}"
+                f":bordercolor=black"
+                f":borderw={SUB_BORDER_W}"
+                f":enable='between(t\\,{t_start}\\,{t_end})'"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "build_subtitle_filters: skipping card %r (t=%.3f–%.3f) due to "
+                "unexpected error — %s",
+                card.text, card.display_start, card.display_end, exc,
+            )
 
     return filters
 
