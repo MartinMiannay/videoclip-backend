@@ -224,9 +224,9 @@ def transcribe_audio(audio_path: str, language: str = "fr") -> list[Word]:
     """
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    compute_type = "float16" if device == "cuda" else "int8"
+    compute_type = "float16"
 
-    logger.info("Loading WhisperX large-v2 model on %s…", device)
+    logger.info("Loading WhisperX large-v2 model on %s (compute_type=%s)…", device, compute_type)
     model = whisperx.load_model("large-v2", device, compute_type=compute_type)
 
     logger.info("Transcribing %s …", audio_path)
@@ -501,7 +501,10 @@ def find_clip_boundaries_with_claude(
 
 # Silence trimming ────────────────────────────────────────────────────────────
 
-_SILENCE_TRIM_THRESHOLD = 1.5   # seconds
+_SILENCE_TRIM_THRESHOLD = 0.8   # seconds
+
+_TRIM_FILLER_WORDS = {"euh", "hm", "hmm", "mmm", "bah", "ben", "voilà"}
+
 
 def trim_clip_silences(
     clips: list[dict[str, Any]],
@@ -510,48 +513,70 @@ def trim_clip_silences(
     """
     Step 4 — Internal silence trimming (no API call).
     For each clip:
-    - Advance start forward to the first word if a leading silence > threshold exists.
-    - Pull end back to the last word's end if a trailing silence > threshold exists.
+    - Strip isolated filler words ("euh", "hm", etc.) from the word list.
+    - Advance start to the first non-filler word if leading silence > threshold.
+    - Pull end back to the last non-filler word's end if trailing silence > threshold.
+    - Log exactly how many seconds are removed at each end.
     Clips that become too short after trimming are dropped.
     """
-    logger.info("Silence trimming — %d clips…", len(clips))
+    logger.info("Silence trimming — %d clips (threshold=%.1fs, fillers=%s)…",
+                len(clips), _SILENCE_TRIM_THRESHOLD, sorted(_TRIM_FILLER_WORDS))
     trimmed: list[dict[str, Any]] = []
 
     for c in clips:
         title = c.get("title", "?")
-        logger.info("  Trimming silences for clip '%s'…", title)
         start = float(c["start"])
         end = float(c["end"])
-        clip_words = [w for w in words if start <= w.start <= end]
+
+        # Build word list for this clip, stripping isolated filler words
+        clip_words = [
+            w for w in words
+            if start <= w.start <= end
+            and w.text.lower().strip(".,!?…") not in _TRIM_FILLER_WORDS
+        ]
 
         if not clip_words:
-            logger.warning("  Clip '%s' has no words — dropping", title)
+            logger.warning("  Clip '%s' has no words after filler removal — dropping", title)
             continue
 
         new_start = start
         new_end = end
+        lead_trimmed = 0.0
+        trail_trimmed = 0.0
 
         # Trim leading silence
-        if clip_words[0].start - start > _SILENCE_TRIM_THRESHOLD:
+        lead_gap = clip_words[0].start - start
+        if lead_gap > _SILENCE_TRIM_THRESHOLD:
             new_start = clip_words[0].start
-            logger.debug(
-                "  Clip '%s': trimmed leading silence %.1fs → start %.1fs",
-                c.get("title", "?"), clip_words[0].start - start, new_start,
+            lead_trimmed = lead_gap
+            logger.info(
+                "  Clip '%s': trimmed leading silence %.2fs (%.1fs → %.1fs)",
+                title, lead_trimmed, start, new_start,
             )
 
         # Trim trailing silence
-        if end - clip_words[-1].end > _SILENCE_TRIM_THRESHOLD:
+        trail_gap = end - clip_words[-1].end
+        if trail_gap > _SILENCE_TRIM_THRESHOLD:
             new_end = clip_words[-1].end + 0.3   # small breath after last word
-            logger.debug(
-                "  Clip '%s': trimmed trailing silence %.1fs → end %.1fs",
-                c.get("title", "?"), end - clip_words[-1].end, new_end,
+            trail_trimmed = end - new_end
+            logger.info(
+                "  Clip '%s': trimmed trailing silence %.2fs (%.1fs → %.1fs)",
+                title, trail_trimmed, end, new_end,
             )
+
+        total_trimmed = lead_trimmed + trail_trimmed
+        if total_trimmed == 0.0:
+            logger.info("  Clip '%s': no silence to trim (lead=%.2fs, trail=%.2fs)",
+                        title, lead_gap, trail_gap)
+        else:
+            logger.info("  Clip '%s': total trimmed %.2fs — new duration %.1fs",
+                        title, total_trimmed, new_end - new_start)
 
         duration = new_end - new_start
         if duration < CLIP_MIN_DURATION:
             logger.warning(
                 "  Clip '%s' dropped after silence trim — duration %.1fs < %ds",
-                c.get("title", "?"), duration, CLIP_MIN_DURATION,
+                title, duration, CLIP_MIN_DURATION,
             )
             continue
 
