@@ -119,6 +119,9 @@ Rules:
 - Themes can be as short as 30 seconds. Do NOT merge adjacent distinct topics.
 - Themes must be non-overlapping and together cover the full interview.
 - Provide a short French label (≤ 8 words) and a one-sentence description.
+- Split aggressively around moments of high tension: shocking stats, contrarian \
+  claims, personal sacrifice stories, direct challenges, or dramatic revelations. \
+  These are prime clip candidates and must not be buried inside a larger segment.
 
 OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 {
@@ -144,8 +147,11 @@ than 10. Every selected theme MUST have a clip; do not skip a theme you have cho
 START RULES — the clip must open on:
 - A surprising stat, bold claim, provocative question, or mid-tension moment
 - The exact word where the tension or insight begins
-- NEVER a greeting, filler phrase ("donc", "voilà", "eh bien"), or scene-setting \
-  sentence
+- Start mid-conflict or mid-revelation, NEVER on context-setting
+- Prefer clips where the first sentence creates immediate dissonance or tension
+- The hook must make the viewer think "wait, what?" in the first 3 seconds
+- NEVER start on "donc", "voilà", "en fait", "bah", "alors", "bonjour", \
+  "aujourd'hui je vais", or any other filler or scene-setting phrase
 
 END RULES — cut immediately after:
 - The key insight or punchline lands
@@ -155,12 +161,20 @@ DURATION: Aim for 30–90 seconds. If the best moment for a theme is slightly \
 outside that range, include it anyway — always return the best clip for each \
 selected theme even if imperfect.
 
-VIRAL HOOK TITLE EXAMPLES:
+VIRAL HOOK EXAMPLES (real high-performing French business clips):
+- "Tu n'es pas intelligent si c'est toi qui crée la valeur" — contrarian reframe \
+  of entrepreneurship
+- "Tu penses que tu es libre, mais tu es 100% esclave" — shocking reframe
+- "1000€ de bénéfice valent en réalité 5000 ou 7000€" — shocking stat
+- "Je dormais dans mes bureaux, mes employés se lavaient dans ma douche" — \
+  personal sacrifice story
+- "T'as 20 ans, y'a pas besoin de partir en vacances" — direct challenge
+- "Je ne pouvais pas survivre avec un loyer de 15 000€" — dramatic consequence
+- "Tu vas savoir si tu es un entrepreneur ou pas" — direct challenge/tension
 - "Embaucher ma femme c'est une bonne idée ?"
 - "Un téléphone pro ? Seulement quand on gagne 1 000 000 €"
 - "Pourquoi faire du black vous appauvrit ?"
 - "Il fait 500 000€/an et voyage pendant 5 mois !"
-- "Je ne peux pas survivre avec un loyer de 15 000 €"
 
 OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 {
