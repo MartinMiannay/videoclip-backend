@@ -1100,6 +1100,35 @@ def get_video_dimensions(video_path: str) -> tuple[int, int]:
     return int(parts[0]), int(parts[1])
 
 
+def probe_video_duration(video_path: str) -> float:
+    """Return actual duration of a video file in seconds using ffprobe."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=duration",
+            "-of", "csv=p=0",
+            video_path,
+        ],
+        capture_output=True, encoding='utf-8', errors='replace',
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        # Fallback: read container duration
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0",
+                video_path,
+            ],
+            capture_output=True, encoding='utf-8', errors='replace',
+        )
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
 def extract_audio(video_path: str, audio_path: str) -> None:
     """Extract mono 16kHz WAV audio — optimal for Whisper."""
     _run_ffmpeg([
@@ -1200,19 +1229,50 @@ def _render_clip_sync(
         # --- Step C+D: burn subtitles + title card ---
         text_burned = os.path.join(tmp_dir, "text.mp4")
         if SUBTITLES_ENABLED:
+            # Probe actual cropped duration — spec.output_duration is calculated
+            # and can diverge from what FFmpeg actually rendered (rounding, segment
+            # boundaries).  Using the wrong value makes between(t,0,X) fire for
+            # fewer frames than expected or not at all on short clips.
+            actual_duration = probe_video_duration(cropped)
+            if abs(actual_duration - duration) > 0.1:
+                logger.warning(
+                    "Clip %s — cropped duration mismatch: spec=%.3fs, actual=%.3fs (using actual)",
+                    spec.clip_id, duration, actual_duration,
+                )
+            else:
+                logger.info(
+                    "Clip %s — cropped duration: spec=%.3fs, actual=%.3fs",
+                    spec.clip_id, duration, actual_duration,
+                )
+            title_display_duration = min(3.0, actual_duration)
+            logger.info(
+                "Clip %s — title card enable=between(t,0,%.3f) (actual_duration=%.3fs)",
+                spec.clip_id, title_display_duration, actual_duration,
+            )
+
             # Each drawtext filter contains commas inside between(t,X,Y), so we
             # keep them as a list and chunk the list — never split a joined string.
-            all_drawtext: list[str] = (
-                build_subtitle_filters(spec.subtitle_cards)
-                + build_title_card_filter(spec.title, duration)
+            # Title card filters go FIRST so they are always rendered in pass 1
+            # against the clean cropped.mp4 with guaranteed t=0 PTS at frame 0.
+            title_filters = build_title_card_filter(spec.title, actual_duration)
+            subtitle_filters = build_subtitle_filters(spec.subtitle_cards)
+            logger.info(
+                "Clip %s — title card: %d filter(s), subtitles: %d filter(s)",
+                spec.clip_id, len(title_filters), len(subtitle_filters),
             )
+            for i, f in enumerate(title_filters):
+                logger.info("Clip %s — title filter[%d]: %s", spec.clip_id, i, f)
+
+            all_drawtext: list[str] = title_filters + subtitle_filters
+
             _CHUNK = 10
             chunks = [all_drawtext[i:i + _CHUNK] for i in range(0, len(all_drawtext), _CHUNK)]
             if not chunks:
                 chunks = [["null"]]
             logger.info(
-                "Subtitle render: %d drawtext filters → %d pass(es) of ≤%d",
-                len(all_drawtext), len(chunks), _CHUNK,
+                "Clip %s — subtitle render: %d drawtext filters → %d pass(es) of ≤%d "
+                "(title card in pass 1 of %d)",
+                spec.clip_id, len(all_drawtext), len(chunks), _CHUNK, len(chunks),
             )
             current_input = cropped
             for pass_idx, chunk in enumerate(chunks):
