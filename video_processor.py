@@ -377,34 +377,50 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
 # ---------------------------------------------------------------------------
 
 def _claude_json(system: str, user: str, label: str, sleep_seconds: int = 60) -> Any:
-    """Single Claude API call → parsed JSON. Sleeps after the call to avoid rate limits."""
+    """Single Claude API call → parsed JSON. Sleeps before the call to avoid rate limits.
+    Retries once after 30 seconds if the response is empty or invalid JSON."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise EnvironmentError("ANTHROPIC_API_KEY is not set")
     client = anthropic.Anthropic(api_key=api_key)
-    logger.info("Claude [%s] sending request — user msg %d chars", label, len(user))
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    raw = message.content[0].text.strip()
-    logger.info(
-        "Claude [%s] raw response (%d chars, stop_reason=%s): %.500s",
-        label, len(raw), message.stop_reason, raw,
-    )
-    raw = re.sub(r"^```[a-z]*\n?", "", raw)
-    raw = re.sub(r"\n?```$", "", raw)
-    try:
-        result = json.loads(raw)
-        logger.info("Claude [%s] JSON parse OK", label)
-    except json.JSONDecodeError as exc:
-        logger.error("Claude [%s] JSON parse FAILED: %s", label, exc)
-        raise ValueError(f"Claude [{label}] invalid JSON: {exc}") from exc
-    logger.info("Claude [%s] done — sleeping %ds to respect rate limit…", label, sleep_seconds)
-    time.sleep(sleep_seconds)
-    return result
+
+    for attempt in range(2):
+        logger.info("Claude [%s] sleeping %ds before request (attempt %d)…", label, sleep_seconds, attempt + 1)
+        time.sleep(sleep_seconds)
+        logger.info("Claude [%s] sending request — user msg %d chars", label, len(user))
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        raw = message.content[0].text.strip()
+        logger.info(
+            "Claude [%s] raw response (%d chars, stop_reason=%s): %.500s",
+            label, len(raw), message.stop_reason, raw,
+        )
+        if not raw:
+            logger.error("Claude [%s] empty response (attempt %d)", label, attempt + 1)
+            if attempt == 0:
+                logger.info("Claude [%s] retrying after 30s…", label)
+                time.sleep(30)
+                continue
+            raise ValueError(f"Claude [{label}] empty response after retry")
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+        try:
+            result = json.loads(raw)
+            logger.info("Claude [%s] JSON parse OK", label)
+            return result
+        except json.JSONDecodeError as exc:
+            logger.error("Claude [%s] JSON parse FAILED (attempt %d): %s\nFull raw response:\n%s", label, attempt + 1, exc, raw)
+            if attempt == 0:
+                logger.info("Claude [%s] retrying after 30s…", label)
+                time.sleep(30)
+                continue
+            raise ValueError(f"Claude [{label}] invalid JSON after retry: {exc}") from exc
+
+    raise RuntimeError(f"Claude [{label}] unreachable")
 
 
 def segment_themes_with_claude(words: list[Word]) -> list[dict[str, Any]]:
