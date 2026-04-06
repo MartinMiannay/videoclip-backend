@@ -376,9 +376,7 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
 # 3. Claude clip selection pipeline (5 steps)
 # ---------------------------------------------------------------------------
 
-_CLAUDE_RATE_LIMIT_SLEEP = 60   # seconds to wait after each Claude call
-
-def _claude_json(system: str, user: str, label: str) -> Any:
+def _claude_json(system: str, user: str, label: str, sleep_seconds: int = 60) -> Any:
     """Single Claude API call → parsed JSON. Sleeps after the call to avoid rate limits."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -404,8 +402,8 @@ def _claude_json(system: str, user: str, label: str) -> Any:
     except json.JSONDecodeError as exc:
         logger.error("Claude [%s] JSON parse FAILED: %s", label, exc)
         raise ValueError(f"Claude [{label}] invalid JSON: {exc}") from exc
-    logger.info("Claude [%s] done — sleeping %ds to respect rate limit…", label, _CLAUDE_RATE_LIMIT_SLEEP)
-    time.sleep(_CLAUDE_RATE_LIMIT_SLEEP)
+    logger.info("Claude [%s] done — sleeping %ds to respect rate limit…", label, sleep_seconds)
+    time.sleep(sleep_seconds)
     return result
 
 
@@ -414,12 +412,13 @@ def segment_themes_with_claude(words: list[Word]) -> list[dict[str, Any]]:
     Step 1 — Thematic segmentation.
     Returns [{start, end, theme, description}, ...] (15–20 entries).
     """
-    transcript = words_to_transcript_text(words)
+    thinned_words = words[::2]  # every other word — enough for theme detection
+    transcript = words_to_transcript_text(thinned_words)
     logger.info(
-        "Step 1 — thematic segmentation — transcript: %d words, %d chars",
-        len(words), len(transcript),
+        "Step 1 — thematic segmentation — transcript: %d words (thinned from %d), %d chars",
+        len(thinned_words), len(words), len(transcript),
     )
-    data = _claude_json(SEGMENT_PROMPT, transcript, "segmentation")
+    data = _claude_json(SEGMENT_PROMPT, transcript, "segmentation", sleep_seconds=60)
     themes = data.get("themes", [])
     logger.info(
         "  Found %d themes:%s",
@@ -464,7 +463,7 @@ def find_clip_boundaries_with_claude(
         )
     user_msg = "\n\n---\n\n".join(parts)
 
-    data = _claude_json(BOUNDARY_PROMPT, user_msg, "boundaries")
+    data = _claude_json(BOUNDARY_PROMPT, user_msg, "boundaries", sleep_seconds=30)
     all_raw_clips = data.get("clips", [])
     logger.info("  Claude returned %d raw clips for %d themes", len(all_raw_clips), len(themes))
 
