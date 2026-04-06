@@ -173,6 +173,19 @@ Select the best 12–14 clips total — one per theme, choosing the themes with 
 the strongest viral potential. You MUST return at least 12 clips, never fewer \
 than 10. Every selected theme MUST have a clip; do not skip a theme you have chosen.
 
+HOOK SELECTION — for each theme, scan ALL sentences in the transcript excerpt \
+and find the single most shocking, controversial or emotionally charged sentence. \
+That sentence must be the hook start.
+
+STRONG hooks contain: a specific number, a personal confession, a contradiction, \
+a direct challenge, or a surprising consequence.
+
+WEAK hooks are: context-setting, topic introductions, questions without tension, \
+transitions.
+
+If the strongest line is mid-excerpt, start there even if it cuts off context. \
+The viewer can figure it out.
+
 START RULES — the clip must open on:
 - A surprising stat, bold claim, provocative question, or mid-tension moment
 - The exact word where the tension or insight begins
