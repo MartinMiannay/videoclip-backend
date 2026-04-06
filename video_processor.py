@@ -100,8 +100,8 @@ if _sys.platform == "win32":
 else:
     FONT_PATH = "/usr/share/fonts/truetype/montserrat/Montserrat-Bold.ttf"
 
-CLIP_MIN_DURATION = 30   # seconds
-CLIP_MAX_DURATION = 90   # seconds
+CLIP_MIN_DURATION = 20   # seconds
+CLIP_MAX_DURATION = 120  # seconds
 
 # ---------------------------------------------------------------------------
 # Claude prompt
@@ -376,7 +376,7 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
 # 3. Claude clip selection pipeline (5 steps)
 # ---------------------------------------------------------------------------
 
-def _claude_json(system: str, user: str, label: str, sleep_seconds: int = 60) -> Any:
+def _claude_json(system: str, user: str, label: str, sleep_seconds: int = 60, max_tokens: int = 4096) -> Any:
     """Single Claude API call → parsed JSON. Sleeps before the call to avoid rate limits.
     Retries once after 30 seconds if the response is empty or invalid JSON."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -390,7 +390,7 @@ def _claude_json(system: str, user: str, label: str, sleep_seconds: int = 60) ->
         logger.info("Claude [%s] sending request — user msg %d chars", label, len(user))
         message = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=4096,
+            max_tokens=max_tokens,
             system=system,
             messages=[{"role": "user", "content": user}],
         )
@@ -414,6 +414,10 @@ def _claude_json(system: str, user: str, label: str, sleep_seconds: int = 60) ->
             return result
         except json.JSONDecodeError as exc:
             logger.error("Claude [%s] JSON parse FAILED (attempt %d): %s\nFull raw response:\n%s", label, attempt + 1, exc, raw)
+            # Try to salvage complete objects from a truncated array response
+            salvaged = _salvage_partial_json_list(raw, label)
+            if salvaged is not None:
+                return salvaged
             if attempt == 0:
                 logger.info("Claude [%s] retrying after 30s…", label)
                 time.sleep(30)
@@ -421,6 +425,46 @@ def _claude_json(system: str, user: str, label: str, sleep_seconds: int = 60) ->
             raise ValueError(f"Claude [{label}] invalid JSON after retry: {exc}") from exc
 
     raise RuntimeError(f"Claude [{label}] unreachable")
+
+
+def _salvage_partial_json_list(raw: str, label: str) -> Any | None:
+    """
+    If Claude's response was cut off mid-array, extract whatever complete
+    top-level objects were returned and wrap them back in the expected envelope.
+    Returns a dict with the salvaged list, or None if nothing could be recovered.
+    """
+    # Find the top-level key and its array (e.g. "clips" or "themes")
+    key_match = re.search(r'"(clips|themes)"\s*:\s*\[', raw)
+    if not key_match:
+        return None
+    key = key_match.group(1)
+    array_start = key_match.end() - 1  # points at '['
+
+    # Walk the raw string collecting complete {...} objects
+    salvaged_items: list[Any] = []
+    i = array_start + 1
+    depth = 0
+    obj_start: int | None = None
+    while i < len(raw):
+        ch = raw[i]
+        if ch == '{':
+            if depth == 0:
+                obj_start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and obj_start is not None:
+                try:
+                    salvaged_items.append(json.loads(raw[obj_start:i + 1]))
+                except json.JSONDecodeError:
+                    pass
+                obj_start = None
+        i += 1
+
+    if salvaged_items:
+        logger.warning("Claude [%s] salvaged %d complete objects from truncated response", label, len(salvaged_items))
+        return {key: salvaged_items}
+    return None
 
 
 def segment_themes_with_claude(words: list[Word]) -> list[dict[str, Any]]:
@@ -453,17 +497,14 @@ def segment_themes_with_claude(words: list[Word]) -> list[dict[str, Any]]:
     return themes
 
 
-_TOP_CLIPS = 14            # keep the N most viral clips
-
-
 def find_clip_boundaries_with_claude(
     themes: list[dict[str, Any]],
     words: list[Word],
 ) -> list[dict[str, Any]]:
     """
     Step 2 — Send all themes to Claude in one call and ask for the best
-    12–14 clips ranked by virality. Returns up to _TOP_CLIPS clips after
-    duration validation and hook-snapping to the first spoken word.
+    clips ranked by virality. Returns all valid clips after duration
+    validation and hook-snapping to the first spoken word.
     """
     logger.info("Step 2 — finding clip boundaries for %d themes (single call)…", len(themes))
 
@@ -479,22 +520,21 @@ def find_clip_boundaries_with_claude(
         )
     user_msg = "\n\n---\n\n".join(parts)
 
-    data = _claude_json(BOUNDARY_PROMPT, user_msg, "boundaries", sleep_seconds=30)
+    data = _claude_json(BOUNDARY_PROMPT, user_msg, "boundaries", sleep_seconds=30, max_tokens=8192)
     all_raw_clips = data.get("clips", [])
-    logger.info("  Claude returned %d raw clips for %d themes", len(all_raw_clips), len(themes))
 
     # Enforce one clip per theme at the code level
     seen_themes: set[str] = set()
     deduped: list[dict[str, Any]] = []
     for c in all_raw_clips:
-        label = c.get("theme", "")
-        if label in seen_themes:
+        theme_label = c.get("theme", "")
+        if theme_label in seen_themes:
             logger.info(
                 "  Clip '%s' dropped — theme '%s' already has a clip",
-                c.get("title", "?"), label,
+                c.get("title", "?"), theme_label,
             )
             continue
-        seen_themes.add(label)
+        seen_themes.add(theme_label)
         deduped.append(c)
 
     valid: list[dict[str, Any]] = []
@@ -521,16 +561,15 @@ def find_clip_boundaries_with_claude(
             continue
         valid.append(c)
 
-    # Rank by virality_score and keep the top _TOP_CLIPS
-    valid.sort(key=lambda c: float(c.get("virality_score", 0)), reverse=True)
-    if len(valid) > _TOP_CLIPS:
-        logger.info("  Keeping top %d clips by virality_score (dropping %d)",
-                    _TOP_CLIPS, len(valid) - _TOP_CLIPS)
-        valid = valid[:_TOP_CLIPS]
-
     logger.info(
-        "  Generated %d clips from %d themes: %s",
-        len(valid), len(themes),
+        "  Clip pipeline: %d raw → %d after dedup → %d after validation",
+        len(all_raw_clips), len(deduped), len(valid),
+    )
+
+    valid.sort(key=lambda c: float(c.get("virality_score", 0)), reverse=True)
+    logger.info(
+        "  Final %d clips: %s",
+        len(valid),
         [f'"{c.get("title", "?")}" score={c.get("virality_score", "?")} ({float(c["end"]) - float(c["start"]):.0f}s)' for c in valid],
     )
     return valid
