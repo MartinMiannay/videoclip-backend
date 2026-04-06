@@ -122,6 +122,9 @@ Rules:
 - Split aggressively around moments of high tension: shocking stats, contrarian \
   claims, personal sacrifice stories, direct challenges, or dramatic revelations. \
   These are prime clip candidates and must not be buried inside a larger segment.
+- You MUST distribute themes evenly across the ENTIRE video. Divide the video into \
+  4 equal quarters and find at least 3–4 themes in EACH quarter. Never cluster more \
+  than 4 themes in any single quarter.
 
 OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 {
@@ -134,6 +137,32 @@ OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
     }
   ]
 }
+"""
+
+SEGMENT_FALLBACK_PROMPT = """\
+You are an expert content analyst for French business and entrepreneurship interviews.
+
+The transcript excerpt below covers {start:.0f}s–{end:.0f}s of an interview. \
+This section was missed in the initial segmentation. \
+Find 3–4 distinct themes within this section.
+
+Rules:
+- Return ONLY themes whose start/end fall within {start:.0f}s–{end:.0f}s.
+- Each theme is one topic, story, opinion, or standalone moment.
+- Themes can be as short as 30 seconds. Do NOT merge adjacent distinct topics.
+- Provide a short French label (≤ 8 words) and a one-sentence description.
+
+OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
+{{
+  "themes": [
+    {{
+      "start": <float seconds>,
+      "end": <float seconds>,
+      "theme": "<short French label>",
+      "description": "<one sentence>"
+    }}
+  ]
+}}
 """
 
 BOUNDARY_PROMPT = """\
@@ -471,29 +500,89 @@ def segment_themes_with_claude(words: list[Word]) -> list[dict[str, Any]]:
     """
     Step 1 — Thematic segmentation.
     Returns [{start, end, theme, description}, ...] (15–20 entries).
+    Forces even distribution across all quarters; calls Claude again for any empty quarter.
     """
     thinned_words = words[::2]  # every other word — enough for theme detection
     transcript = words_to_transcript_text(thinned_words)
+    video_end = words[-1].end if words else 0.0
     logger.info(
-        "Step 1 — thematic segmentation — transcript: %d words (thinned from %d), %d chars",
-        len(thinned_words), len(words), len(transcript),
+        "Step 1 — thematic segmentation — transcript: %d words (thinned from %d), %d chars, video end %.1fs",
+        len(thinned_words), len(words), len(transcript), video_end,
     )
     data = _claude_json(SEGMENT_PROMPT, transcript, "segmentation", sleep_seconds=60)
     themes = data.get("themes", [])
+
+    themes = _log_and_fix_quarter_distribution(themes, words, video_end)
+
+    if len(themes) < 15:
+        logger.warning(
+            "  !! Only %d themes returned (expected ≥ 15). Consider re-running.", len(themes)
+        )
+    return themes
+
+
+def _log_and_fix_quarter_distribution(
+    themes: list[dict[str, Any]],
+    words: list[Word],
+    video_end: float,
+) -> list[dict[str, Any]]:
+    """Log theme counts per quarter; call Claude for any quarter with 0 themes."""
+    quarter = video_end / 4
+    boundaries = [(i * quarter, (i + 1) * quarter) for i in range(4)]
+
+    def quarter_index(t: dict[str, Any]) -> int:
+        mid = (t.get("start", 0) + t.get("end", 0)) / 2
+        for i, (q_start, q_end) in enumerate(boundaries):
+            if q_start <= mid < q_end:
+                return i
+        return 3  # clamp last theme to Q4
+
+    counts = [0, 0, 0, 0]
+    for t in themes:
+        counts[quarter_index(t)] += 1
+
     logger.info(
-        "  Found %d themes:%s",
-        len(themes),
+        "  Theme distribution across quarters (each ~%.0fs):\n"
+        "    Q1 [%.0fs–%.0fs]: %d themes\n"
+        "    Q2 [%.0fs–%.0fs]: %d themes\n"
+        "    Q3 [%.0fs–%.0fs]: %d themes\n"
+        "    Q4 [%.0fs–%.0fs]: %d themes",
+        quarter,
+        boundaries[0][0], boundaries[0][1], counts[0],
+        boundaries[1][0], boundaries[1][1], counts[1],
+        boundaries[2][0], boundaries[2][1], counts[2],
+        boundaries[3][0], boundaries[3][1], counts[3],
+    )
+    logger.info(
+        "  All themes:%s",
         "".join(
-            f"\n    [{i+1:2d}] {t.get('theme', '?')!r:50s} "
+            f"\n    [{i+1:2d}] Q{quarter_index(t)+1} {t.get('theme', '?')!r:50s} "
             f"{t.get('start', 0):.1f}s–{t.get('end', 0):.1f}s "
             f"({t.get('end', 0) - t.get('start', 0):.0f}s)"
             for i, t in enumerate(themes)
         ),
     )
-    if len(themes) < 15:
+
+    for qi, (q_start, q_end) in enumerate(boundaries):
+        if counts[qi] > 0:
+            continue
         logger.warning(
-            "  !! Only %d themes returned (expected ≥ 15). Consider re-running.", len(themes)
+            "  !! Q%d [%.0fs–%.0fs] has 0 themes — running fallback segmentation…",
+            qi + 1, q_start, q_end,
         )
+        section_words = [w for w in words if q_start <= w.start < q_end]
+        thinned = section_words[::2]
+        if not thinned:
+            logger.warning("  !! Q%d: no words found in section, skipping fallback", qi + 1)
+            continue
+        section_transcript = words_to_transcript_text(thinned)
+        prompt = SEGMENT_FALLBACK_PROMPT.format(start=q_start, end=q_end)
+        fallback_data = _claude_json(prompt, section_transcript, f"segmentation-fallback-Q{qi+1}", sleep_seconds=30)
+        fallback_themes = fallback_data.get("themes", [])
+        logger.info("  Fallback Q%d: got %d themes", qi + 1, len(fallback_themes))
+        themes = themes + fallback_themes
+
+    themes.sort(key=lambda t: t.get("start", 0))
     return themes
 
 
