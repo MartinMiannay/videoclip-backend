@@ -1648,43 +1648,60 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
             )
         else:
             # ----------------------------------------------------------------
-            # Step 1: Transcribe
+            # Step 1: Transcribe (skip if transcript already cached, e.g. after
+            # manual-mode pre-transcription)
             # ----------------------------------------------------------------
-            logger.info("Step 1: starting audio extraction")
-            await set_progress("transcribing", 5, "Transcription en cours…")
-
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as af:
-                audio_path = af.name
-            logger.info("Temp wav path: %s", audio_path)
-            try:
-                logger.info("Calling extract_audio...")
-                await asyncio.get_event_loop().run_in_executor(
-                    None, extract_audio, source_video_path, audio_path
-                )
-                logger.info("Audio extracted OK, starting transcription")
-                words = await asyncio.get_event_loop().run_in_executor(
-                    None, transcribe_audio, audio_path
-                )
+            stored_transcript = doc.get("transcript_words", [])
+            if stored_transcript and not is_retry:
                 logger.info(
-                    "Transcription complete: %d words, last word ends at %.1fs",
-                    len(words), words[-1].end if words else 0,
+                    "Transcript already cached (%d words) — skipping WhisperX",
+                    len(stored_transcript),
                 )
-            finally:
-                if os.path.exists(audio_path):
-                    os.unlink(audio_path)
+                words = [
+                    Word(
+                        text=w["text"],
+                        start=float(w["start"]),
+                        end=float(w["end"]),
+                        precise=w.get("precise", True),
+                    )
+                    for w in stored_transcript
+                ]
+            else:
+                logger.info("Step 1: starting audio extraction")
+                await set_progress("transcribing", 5, "Transcription en cours…")
 
-            # Persist transcript to DB for retry reuse
-            logger.info("Persisting transcript to DB (%d words)…", len(words))
-            word_dicts = [
-                {"text": w.text, "start": w.start, "end": w.end, "precise": w.precise}
-                for w in words
-            ]
-            flat_transcript = " ".join(w.text for w in words)
-            await projects.update_one(
-                {"id": project_id},
-                {"$set": {"transcript_words": word_dicts, "transcript": flat_transcript}},
-            )
-            logger.info("Transcript persisted to DB OK")
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as af:
+                    audio_path = af.name
+                logger.info("Temp wav path: %s", audio_path)
+                try:
+                    logger.info("Calling extract_audio...")
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, extract_audio, source_video_path, audio_path
+                    )
+                    logger.info("Audio extracted OK, starting transcription")
+                    words = await asyncio.get_event_loop().run_in_executor(
+                        None, transcribe_audio, audio_path
+                    )
+                    logger.info(
+                        "Transcription complete: %d words, last word ends at %.1fs",
+                        len(words), words[-1].end if words else 0,
+                    )
+                finally:
+                    if os.path.exists(audio_path):
+                        os.unlink(audio_path)
+
+                # Persist transcript to DB for retry reuse
+                logger.info("Persisting transcript to DB (%d words)…", len(words))
+                word_dicts = [
+                    {"text": w.text, "start": w.start, "end": w.end, "precise": w.precise}
+                    for w in words
+                ]
+                flat_transcript = " ".join(w.text for w in words)
+                await projects.update_one(
+                    {"id": project_id},
+                    {"$set": {"transcript_words": word_dicts, "transcript": flat_transcript}},
+                )
+                logger.info("Transcript persisted to DB OK")
 
             # ----------------------------------------------------------------
             # Step 2: Thematic segmentation
@@ -1900,6 +1917,274 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
             _f.write(f"\n=== {project_id} ===\n")
             _f.write(_tb.format_exc())
         logger.exception("Fatal error in process_video_pipeline for %s: %s", project_id, exc)
+        await set_progress("error", 0, str(exc)[:300], status="error")
+
+    finally:
+        if output_dir and os.path.isdir(output_dir):
+            import shutil
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Manual mode pipelines
+# ---------------------------------------------------------------------------
+
+async def transcribe_only_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> None:
+    """Run transcription only, then set status='transcribed' so the frontend
+    can present the manual clip selection UI."""
+    projects = db["projects"]
+
+    async def set_progress(
+        step: str, progress: float, details: str = "", status: str = "processing"
+    ) -> None:
+        await projects.update_one(
+            {"id": project_id},
+            {"$set": {
+                "status": status,
+                "processing_step": step,
+                "processing_progress": progress,
+                "processing_details": details,
+            }},
+        )
+
+    try:
+        doc = await projects.find_one({"id": project_id})
+        if not doc:
+            return
+
+        source_video_path = doc.get("local_video_path", "")
+        if not source_video_path or not os.path.isfile(source_video_path):
+            await set_progress("error", 0, "Video file not found. Please re-upload.", status="error")
+            return
+
+        await set_progress("transcribing", 5, "Transcription en cours…")
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as af:
+            audio_path = af.name
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, extract_audio, source_video_path, audio_path
+            )
+            words = await asyncio.get_event_loop().run_in_executor(
+                None, transcribe_audio, audio_path
+            )
+        finally:
+            if os.path.exists(audio_path):
+                os.unlink(audio_path)
+
+        word_dicts = [
+            {"text": w.text, "start": w.start, "end": w.end, "precise": w.precise}
+            for w in words
+        ]
+        flat_transcript = " ".join(w.text for w in words)
+        duration = await asyncio.get_event_loop().run_in_executor(
+            None, probe_video_duration, source_video_path
+        )
+        await projects.update_one(
+            {"id": project_id},
+            {"$set": {
+                "transcript_words": word_dicts,
+                "transcript": flat_transcript,
+                "duration": duration,
+                "status": "transcribed",
+                "processing_step": "transcribed",
+                "processing_progress": 1.0,
+                "processing_details": "Transcription terminée — sélectionnez vos clips.",
+            }},
+        )
+        logger.info("transcribe_only_pipeline done for %s (%d words)", project_id, len(words))
+
+    except Exception as exc:
+        logger.exception("transcribe_only_pipeline failed for %s: %s", project_id, exc)
+        await set_progress("error", 0, str(exc)[:300], status="error")
+
+
+async def render_manual_pipeline(
+    project_id: str, manual_clips: list[dict], db: AsyncIOMotorDatabase
+) -> None:
+    """Render clips with manually specified boundaries.
+
+    Each item in *manual_clips* must have:
+        start_seconds: float
+        end_seconds:   float
+        title:         str
+        hook_note:     str  (optional)
+    """
+    from storage import put_file as _put_file
+
+    projects = db["projects"]
+
+    async def set_progress(
+        step: str, progress: float, details: str = "", status: str = "processing"
+    ) -> None:
+        await projects.update_one(
+            {"id": project_id},
+            {"$set": {
+                "status": status,
+                "processing_step": step,
+                "processing_progress": progress,
+                "processing_details": details,
+            }},
+        )
+
+    async def update_clip(clip_id: str, **fields: Any) -> None:
+        await projects.update_one(
+            {"id": project_id, "short_clips.id": clip_id},
+            {"$set": {f"short_clips.$.{k}": v for k, v in fields.items()}},
+        )
+
+    output_dir: str | None = None
+    try:
+        doc = await projects.find_one({"id": project_id})
+        if not doc:
+            return
+
+        source_video_path = doc.get("local_video_path", "")
+        if not source_video_path or not os.path.isfile(source_video_path):
+            await set_progress("error", 0, "Video file not found. Please re-upload.", status="error")
+            return
+
+        # Restore transcript words
+        stored_words = doc.get("transcript_words", [])
+        words = [
+            Word(
+                text=w["text"],
+                start=float(w["start"]),
+                end=float(w["end"]),
+                precise=w.get("precise", True),
+            )
+            for w in stored_words
+        ]
+
+        # Build raw clip list from manual input, then apply silence trimming
+        raw_clips = [
+            {
+                "start": float(c["start_seconds"]),
+                "end": float(c["end_seconds"]),
+                "title": c.get("title", ""),
+                "hook": c.get("hook_note", ""),
+            }
+            for c in manual_clips
+        ]
+        raw_clips = trim_clip_silences(raw_clips, words)
+        if not raw_clips:
+            await set_progress("error", 0, "All clips were too short after silence trimming.", status="error")
+            return
+
+        # Build ClipSpec objects and initial DB docs
+        clip_specs_map: dict[str, ClipSpec] = {}
+        clip_docs: list[dict] = []
+
+        for raw in raw_clips:
+            cid = str(uuid.uuid4())[:8]
+            start = float(raw["start"])
+            end = float(raw["end"])
+            segments: list[tuple[float, float]] = raw.get("segments", [])
+
+            if segments:
+                all_clip_words = [w for w in words if start <= w.start <= end]
+                clip_words = _remap_words_to_output(all_clip_words, segments)
+                cards = build_subtitle_cards(clip_words, clip_start=0.0)
+            else:
+                clip_words = [w for w in words if start <= w.start <= end]
+                cards = build_subtitle_cards(clip_words, clip_start=start)
+
+            spec = ClipSpec(
+                clip_id=cid,
+                project_id=project_id,
+                start=start,
+                end=end,
+                title=raw.get("title", ""),
+                hook=raw.get("hook", ""),
+                words=clip_words,
+                subtitle_cards=cards,
+                segments=segments,
+            )
+            clip_specs_map[cid] = spec
+            clip_docs.append({
+                "id": cid,
+                "caption": raw.get("title", ""),
+                "hook": raw.get("hook", ""),
+                "start": start,
+                "end": end,
+                "segments": [[s, e] for s, e in segments],
+                "status": "pending",
+                "storage_path": "",
+                "error": "",
+            })
+
+        await projects.update_one({"id": project_id}, {"$set": {"short_clips": clip_docs}})
+
+        # Face detection (shared across all clips)
+        await set_progress("detecting_speakers", 10, "Détection des visages…")
+        source_w, source_h = await asyncio.get_event_loop().run_in_executor(
+            None, get_video_dimensions, source_video_path
+        )
+        detections = await asyncio.get_event_loop().run_in_executor(
+            None, detect_speakers, source_video_path
+        )
+
+        # Render all clips in parallel
+        await set_progress("rendering", 20, f"Rendu de {len(clip_specs_map)} clips…")
+        output_dir = tempfile.mkdtemp(prefix=f"project_{project_id}_manual_")
+        semaphore = asyncio.Semaphore(MAX_PARALLEL_CLIPS)
+        total = len(clip_specs_map)
+        done_count = 0
+
+        async def render_and_upload(spec: ClipSpec, idx: int) -> None:
+            nonlocal done_count
+            async with semaphore:
+                await update_clip(spec.clip_id, status="rendering", error="")
+                try:
+                    local_path = await render_clip(
+                        spec, source_video_path, source_w, source_h,
+                        detections, output_dir,
+                    )
+                    if not os.path.exists(local_path):
+                        raise FileNotFoundError(f"Rendered file missing: {local_path}")
+                    if os.path.getsize(local_path) < 100_000:
+                        raise ValueError(
+                            f"Rendered file too small: {os.path.getsize(local_path)} bytes"
+                        )
+                    storage_path = f"{project_id}/{spec.clip_id}.mp4"
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, _put_file, local_path, storage_path
+                    )
+                    done_count += 1
+                    progress = 20 + int(done_count / total * 75)
+                    await update_clip(spec.clip_id, status="done", storage_path=storage_path)
+                    await set_progress("rendering", progress, f"{done_count}/{total} clips prêts")
+                    logger.info("Manual clip %d/%d done: %s", idx + 1, total, spec.clip_id)
+                except Exception as exc:
+                    logger.exception("Manual clip %s failed: %s", spec.clip_id, exc)
+                    await update_clip(spec.clip_id, status="error", error=str(exc)[:500])
+                finally:
+                    local = os.path.join(output_dir, f"{spec.clip_id}.mp4")
+                    if os.path.exists(local):
+                        os.unlink(local)
+
+        await asyncio.gather(*[
+            render_and_upload(spec, i)
+            for i, spec in enumerate(clip_specs_map.values())
+        ])
+
+        # Final status
+        final_doc = await projects.find_one({"id": project_id})
+        all_clips = final_doc.get("short_clips", []) if final_doc else []
+        n_done = sum(1 for c in all_clips if c.get("status") == "done")
+        n_err = sum(1 for c in all_clips if c.get("status") == "error")
+
+        final_status = "done" if n_err == 0 else ("partial" if n_done > 0 else "error")
+        await set_progress(
+            "done" if final_status != "error" else "error",
+            100,
+            f"{n_done} clips prêts" + (f", {n_err} erreurs" if n_err else ""),
+            status=final_status,
+        )
+        logger.info("render_manual_pipeline complete — %d done, %d errors", n_done, n_err)
+
+    except Exception as exc:
+        logger.exception("render_manual_pipeline failed for %s: %s", project_id, exc)
         await set_progress("error", 0, str(exc)[:300], status="error")
 
     finally:

@@ -316,6 +316,94 @@ async def update_references(project_id: str, data: dict):
     return {"ok": True}
 
 
+@api_router.post("/projects/{project_id}/transcribe")
+async def start_transcription_only(project_id: str):
+    """Run only the transcription step so the user can do manual clip selection."""
+    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
+    if not project:
+        raise HTTPException(404, "Project not found")
+    if project.get("status") == "processing":
+        return {"message": "Already processing"}
+
+    local_path = project.get("local_video_path", "")
+    if local_path and not os.path.isfile(local_path):
+        await db.projects.update_one(
+            {"id": project_id},
+            {"$set": {"status": "error", "processing_step": "error", "processing_progress": 0,
+                      "processing_details": "Video file was lost due to a server restart. Please re-upload your video."}}
+        )
+        raise HTTPException(410, "Video file was lost due to a server restart. Please re-upload your video.")
+
+    await db.projects.update_one(
+        {"id": project_id},
+        {"$set": {"status": "processing", "processing_step": "transcribing",
+                  "processing_progress": 0, "processing_details": "Transcription en cours…"}}
+    )
+
+    from video_processor import transcribe_only_pipeline
+    asyncio.create_task(transcribe_only_pipeline(project_id, db))
+    return {"message": "Transcription started", "project_id": project_id}
+
+
+@api_router.get("/projects/{project_id}/transcript-words")
+async def get_transcript_words(project_id: str):
+    """Return the word-level transcript for use in the manual selection UI."""
+    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
+    if not project:
+        raise HTTPException(404, "Project not found")
+    return {"transcript_words": project.get("transcript_words", [])}
+
+
+@api_router.get("/projects/{project_id}/video")
+async def stream_project_video(project_id: str):
+    """Stream the original uploaded video file for the HTML5 player."""
+    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
+    if not project:
+        raise HTTPException(404, "Project not found")
+    video_path = project.get("local_video_path", "")
+    if not video_path or not os.path.isfile(video_path):
+        raise HTTPException(404, "Video file not found")
+    return FileResponse(video_path, media_type="video/mp4")
+
+
+class ManualClip(BaseModel):
+    start_seconds: float
+    end_seconds: float
+    title: str
+    hook_note: str = ""
+
+
+class ManualRenderRequest(BaseModel):
+    clips: List[ManualClip]
+
+
+@api_router.post("/projects/{project_id}/render-manual")
+async def render_manual_clips(project_id: str, data: ManualRenderRequest):
+    """Render clips with user-specified boundaries (manual mode).
+    Skips Claude clip selection entirely — uses the full rendering pipeline."""
+    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
+    if not project:
+        raise HTTPException(404, "Project not found")
+    if project.get("status") == "processing":
+        return {"message": "Already processing"}
+    if not data.clips:
+        raise HTTPException(400, "No clips provided")
+
+    await db.projects.update_one(
+        {"id": project_id},
+        {"$set": {"status": "processing", "processing_step": "rendering",
+                  "processing_progress": 0, "processing_details": "Démarrage du rendu…",
+                  "short_clips": []}}
+    )
+
+    from video_processor import render_manual_pipeline
+    asyncio.create_task(render_manual_pipeline(project_id, [c.model_dump() for c in data.clips], db))
+
+    result = await db.projects.find_one({"id": project_id}, {"_id": 0, "transcript_words": 0})
+    result.pop("local_video_path", None)
+    return result
+
+
 @api_router.post("/projects/{project_id}/retry-failed")
 async def retry_failed_clips(project_id: str):
     """Re-process only the clips that failed (status='error').
