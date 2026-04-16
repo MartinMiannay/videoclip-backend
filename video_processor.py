@@ -73,7 +73,7 @@ SUBTITLES_ENABLED = True
 FACE_CONF_THRESHOLD = 0.7
 
 # Speaker framing
-FACE_Y_TARGET_RATIO = 0.30   # target face position from top of output frame (30%)
+FACE_Y_TARGET_RATIO = 0.25   # target face position from top of output frame (25% = upper body visible)
 FACE_CROP_H_RATIO = 0.80     # crop height as fraction of source_h — zoom in to allow Y adjustment
 SPEAKER_SWITCH_MIN_INTERVAL = 2.0  # minimum seconds between camera switches
 
@@ -1041,11 +1041,14 @@ def build_dynamic_crop_filter(
         y = cy - int(FACE_Y_TARGET_RATIO * crop_h)
         return max(0, min(source_h - crop_h, y))
 
-    # --- No faces: static centre crop ---
+    # --- No faces: crop top 75 % of frame, centred horizontally ---
+    # Assumes faces (when not detected) are in the upper portion of the shot.
     if not speaker_positions:
-        x = (source_w - crop_w) // 2
-        y = (source_h - crop_h) // 2
-        return f"crop={crop_w}:{crop_h}:{x}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+        nf_h = int(source_h * 0.75)
+        nf_w = nf_h * 9 // 16
+        nf_w = min(nf_w, source_w)
+        nf_x = max(0, (source_w - nf_w) // 2)
+        return f"crop={nf_w}:{nf_h}:{nf_x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
     # --- One speaker: static crop centred on face ---
     if len(speaker_positions) == 1:
@@ -1184,81 +1187,38 @@ def build_title_card_filter(title: str, duration: float) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _escape_drawtext(text: str) -> str:
-    """Escape special characters for FFmpeg drawtext text= option.
+    """Sanitize text for FFmpeg drawtext text= option.
 
-    Escape order matters — backslash must come first to avoid double-escaping.
+    Uses a replace/strip approach rather than backslash-escaping chains, which
+    are fragile and produce hard-to-debug double-escaping bugs.
 
-    Characters handled:
-      \\  → \\\\   (must be first)
-      %   → %%     (FFmpeg expands %{var} at render time; bare % corrupts filter)
-      '   → \u2019 (right single quotation mark — keeps text='...' delimiters intact)
-      :   → \\:    (FFmpeg option separator inside drawtext)
-      [   → \\[    (FFmpeg stream specifier syntax)
-      ]   → \\]
-      {   → \\{    (FFmpeg variable expansion: %{pts} etc.)
-      }   → \\}
-      ,   — NOT escaped (handled safely inside text='...' quotes)
+    Rules (applied in order):
+      %   → %%      (FFmpeg variable expansion guard — must come first)
+      '   → \u2019  (right single quote — preserves apostrophe appearance and
+                     keeps the surrounding text='...' delimiters intact)
+      ;   → stripped (filter-graph separator in filter_complex)
+      :   → stripped (option separator; strip to avoid any parser ambiguity)
+      \\  → stripped (no backslash escaping used in this approach)
+      [   → stripped (stream-specifier syntax)
+      ]   → stripped
+      {   → stripped (FFmpeg template vars: %{pts})
+      }   → stripped
     """
-    try:
-        original = text
-        text = text.replace("\\", "\\\\")
-        text = text.replace("%", "%%")
-        text = text.replace("'", "\u2019")
-        text = text.replace(":", "\\:")
-        text = text.replace("[", "\\[")
-        text = text.replace("]", "\\]")
-        text = text.replace("{", "\\{")
-        text = text.replace("}", "\\}")
-        return text
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "_escape_drawtext failed for %r (%s) — falling back to ASCII-safe replacement",
-            original, exc,
-        )
-        # Fallback: keep only printable ASCII and basic accented Latin characters,
-        # replace everything else with a space so the card still renders.
-        safe = ""
-        for ch in original:
-            cp = ord(ch)
-            if 0x20 <= cp <= 0x7E:          # printable ASCII (space–tilde)
-                # Still escape the ASCII special chars individually
-                if ch == "%":
-                    safe += "%%"
-                elif ch == "'":
-                    safe += "\u2019"
-                elif ch == ":":
-                    safe += "\\:"
-                elif ch == "[":
-                    safe += "\\["
-                elif ch == "]":
-                    safe += "\\]"
-                elif ch == "{":
-                    safe += "\\{"
-                elif ch == "}":
-                    safe += "\\}"
-                elif ch == "\\":
-                    safe += "\\\\"
-                else:
-                    safe += ch
-            elif 0xC0 <= cp <= 0x2AF:       # Latin Extended, common accents
-                safe += ch
-            else:
-                safe += " "
-        return safe.strip() or "?"
+    text = text.replace("%", "%%")
+    text = text.replace("'", "\u2019")
+    for ch in ";:\\[]{}":
+        text = text.replace(ch, "")
+    return text
 
 
 def build_subtitle_filters(cards: list[SubtitleCard]) -> list[str]:
     """
     Build FFmpeg drawtext filter fragments for all subtitle cards.
-    Returns a list of individual drawtext filter strings (not joined),
-    so callers can chunk them into batches before passing to FFmpeg.
+    Returns one drawtext filter per card (not joined), so callers can chunk
+    them into batches before passing to FFmpeg.
 
-    Each card produces N+1 drawtext filters:
-      1. The full card text in white for the entire card window (base layer).
-      2. One yellow (#FFD700) filter per word, active only during that word's
-         spoken window and positioned over the matching white text.
-
-    Font: Montserrat Bold, size 52, black outline 2px.
+    Style: white text, Montserrat Bold size 52, black outline 2px, mixed case.
+    No per-word highlighting — single pass per card.
     """
     if not cards:
         return []
@@ -1271,8 +1231,6 @@ def build_subtitle_filters(cards: list[SubtitleCard]) -> list[str]:
             full_text = _escape_drawtext(card.text)
             t_start = f"{card.display_start:.3f}"
             t_end   = f"{card.display_end:.3f}"
-
-            # ── Base layer: full card in white for the entire card window ──
             filters.append(
                 f"drawtext=fontfile={FONT_PATH}"
                 f":fontsize={SUB_FONTSIZE}"
@@ -1284,40 +1242,9 @@ def build_subtitle_filters(cards: list[SubtitleCard]) -> list[str]:
                 f":borderw={SUB_BORDER_W}"
                 f":enable='between(t\\,{t_start}\\,{t_end})'"
             )
-
-            # ── Per-word yellow highlight overlay ──────────────────────────
-            # Approximate the x offset of each word within the centred card
-            # text using the same heuristic as _measure_text_width so the
-            # yellow glyph lands on top of its white counterpart.
-            total_w = _measure_text_width(card.text, SUB_FONTSIZE)
-            for wi, word in enumerate(card.words):
-                prefix = " ".join(w.text for w in card.words[:wi])
-                if prefix:
-                    prefix += " "   # space between prefix and this word
-                prefix_w = _measure_text_width(prefix, SUB_FONTSIZE)
-                word_x   = f"(w-{total_w})/2+{prefix_w}"
-
-                word_text = _escape_drawtext(word.text)
-                # word.start / word.end are in output timeline (set by flush())
-                wt_start = f"{max(0.0, word.start):.3f}"
-                wt_end   = f"{min(card.display_end, word.end):.3f}"
-
-                filters.append(
-                    f"drawtext=fontfile={FONT_PATH}"
-                    f":fontsize={SUB_FONTSIZE}"
-                    f":fontcolor=#FFD700"
-                    f":text='{word_text}'"
-                    f":x={word_x}"
-                    f":y={sub_y}"
-                    f":bordercolor=black"
-                    f":borderw={SUB_BORDER_W}"
-                    f":enable='between(t\\,{wt_start}\\,{wt_end})'"
-                )
-
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "build_subtitle_filters: skipping card %r (t=%.3f–%.3f) due to "
-                "unexpected error — %s",
+                "build_subtitle_filters: skipping card %r (t=%.3f–%.3f) — %s",
                 card.text, card.display_start, card.display_end, exc,
             )
 
@@ -1764,6 +1691,18 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
 
     output_dir: str | None = None
     try:
+        # ----------------------------------------------------------------
+        # Startup disk cleanup — remove stale /tmp/clip_* dirs left by
+        # any previously crashed or killed pipeline run.
+        # ----------------------------------------------------------------
+        import glob as _glob
+        import shutil as _shutil
+        _tmp_root = tempfile.gettempdir()
+        for _stale in _glob.glob(os.path.join(_tmp_root, "clip_*")):
+            if os.path.isdir(_stale):
+                _shutil.rmtree(_stale, ignore_errors=True)
+                logger.info("Cleaned up stale clip temp dir: %s", _stale)
+
         # ----------------------------------------------------------------
         # Load project
         # ----------------------------------------------------------------
