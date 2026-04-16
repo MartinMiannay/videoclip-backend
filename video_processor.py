@@ -54,7 +54,7 @@ SAFE_MARGIN = 40          # px from each edge
 MAX_TITLE_W = FRAME_W - SAFE_MARGIN * 2   # 1000 px
 
 # Subtitle style
-SUB_FONT = "Arial-Bold"
+SUB_FONT = "Montserrat-Bold"
 SUB_FONTSIZE = 52
 SUB_BORDER_W = 2          # thin black outline
 SUB_BOX_BORDER = 8        # padding around subtitle background box (px)
@@ -71,6 +71,11 @@ SUBTITLES_ENABLED = True
 
 # Face detection thresholds
 FACE_CONF_THRESHOLD = 0.7
+
+# Speaker framing
+FACE_Y_TARGET_RATIO = 0.30   # target face position from top of output frame (30%)
+FACE_CROP_H_RATIO = 0.80     # crop height as fraction of source_h — zoom in to allow Y adjustment
+SPEAKER_SWITCH_MIN_INTERVAL = 2.0  # minimum seconds between camera switches
 
 ROOT_DIR = Path(__file__).parent
 MUSIC_DIR = ROOT_DIR / "music"
@@ -90,13 +95,17 @@ if _sys.platform == "win32":
     # Drive-letter paths (C:/...) break FFmpeg's filter parser because `:` is a
     # delimiter.  Copy the font to assets/ at import time and reference it by a
     # path relative to ROOT_DIR — no colon, no issue.
-    _win_font_src = Path("C:/Windows/Fonts/arialbd.ttf")
-    _win_font_dst = ASSETS_DIR / "arialbd.ttf"
+    # Prefer Montserrat-Bold; fall back to Arial Bold if not installed.
+    _montserrat_src = Path("C:/Windows/Fonts/Montserrat-Bold.ttf")
+    _arial_src      = Path("C:/Windows/Fonts/arialbd.ttf")
+    _win_font_src   = _montserrat_src if _montserrat_src.exists() else _arial_src
+    _win_font_name  = _win_font_src.name
+    _win_font_dst   = ASSETS_DIR / _win_font_name
     if not _win_font_dst.exists() and _win_font_src.exists():
         import shutil as _shutil
         ASSETS_DIR.mkdir(exist_ok=True)
         _shutil.copy2(_win_font_src, _win_font_dst)
-    FONT_PATH = "assets/arialbd.ttf"   # relative to ROOT_DIR, passed as ffmpeg cwd
+    FONT_PATH = f"assets/{_win_font_name}"  # relative to ROOT_DIR, passed as ffmpeg cwd
 else:
     FONT_PATH = "/usr/share/fonts/truetype/montserrat/Montserrat-Bold.ttf"
 
@@ -243,6 +252,7 @@ class Word:
     start: float   # seconds
     end: float     # seconds
     precise: bool = True
+    speaker: str | None = None  # WhisperX diarization label e.g. "SPEAKER_00"
 
 
 @dataclass
@@ -290,8 +300,8 @@ def transcribe_audio(audio_path: str, language: str = "fr") -> list[Word]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type = "float16"
 
-    logger.info("Loading WhisperX large-v2 model on %s (compute_type=%s)…", device, compute_type)
-    model = whisperx.load_model("large-v2", device, compute_type=compute_type)
+    logger.info("Loading WhisperX large-v3 model on %s (compute_type=%s)…", device, compute_type)
+    model = whisperx.load_model("large-v3", device, compute_type=compute_type)
 
     logger.info("Transcribing %s …", audio_path)
     result = model.transcribe(audio_path, language=language)
@@ -305,8 +315,23 @@ def transcribe_audio(audio_path: str, language: str = "fr") -> list[Word]:
         return_char_alignments=False,
     )
 
+    # Optional speaker diarization — requires HF_TOKEN and pyannote
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    if hf_token:
+        try:
+            logger.info("Running speaker diarization (HF_TOKEN found)…")
+            diarize_model = whisperx.DiarizationPipeline(
+                use_auth_token=hf_token, device=device
+            )
+            diarize_segments = diarize_model(audio_path)
+            result = whisperx.assign_word_speakers(diarize_segments, result)
+            logger.info("Diarization complete")
+        except Exception as _dia_err:
+            logger.warning("Diarization failed (%s) — speaker switching will use pause detection", _dia_err)
+
     words: list[Word] = []
     for segment in result["segments"]:
+        seg_speaker: str | None = segment.get("speaker")
         for w in segment.get("words", []):
             raw = w.get("word", "").strip()
             if not raw:
@@ -319,9 +344,11 @@ def transcribe_audio(audio_path: str, language: str = "fr") -> list[Word]:
                 start=float(w["start"]),
                 end=float(w["end"]),
                 precise=True,
+                speaker=w.get("speaker") or seg_speaker,
             ))
 
-    logger.info("Transcription complete — %d words", len(words))
+    n_speakers = len({w.speaker for w in words if w.speaker})
+    logger.info("Transcription complete — %d words, %d speaker(s) detected", len(words), n_speakers)
     return words
 
 
@@ -381,10 +408,16 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
     def flush(grp: list[Word]) -> None:
         if not grp:
             return
-        raw_start = grp[0].start - clip_start
-        raw_end = grp[-1].end - clip_start
+        # Convert word timestamps to output timeline so per-word highlight
+        # filters have consistent timing with display_start / display_end.
+        output_words = [
+            Word(text=w.text, start=w.start - clip_start, end=w.end - clip_start, precise=w.precise)
+            for w in grp
+        ]
+        raw_start = output_words[0].start
+        raw_end = output_words[-1].end
         cards.append(SubtitleCard(
-            words=grp,
+            words=output_words,
             display_start=max(0.0, raw_start - SUB_SHIFT_MS),
             display_end=raw_end,
         ))
@@ -703,6 +736,7 @@ def _remap_words_to_output(
                     start=output_offset + (w.start - seg_start),
                     end=output_offset + (w.end - seg_start),
                     precise=w.precise,
+                    speaker=w.speaker,
                 ))
         output_offset += seg_end - seg_start
     return remapped
@@ -843,6 +877,7 @@ def _collect_faces_mediapipe(video_path: str, sample_every_n_frames: int) -> lis
                         bbox = det.bounding_box
                         faces.append({
                             "cx": bbox.origin_x + bbox.width // 2,
+                            "cy": bbox.origin_y + bbox.height // 2,
                             "area": bbox.width * bbox.height,
                         })
             frame_idx += 1
@@ -874,7 +909,7 @@ def _collect_faces_opencv(video_path: str, sample_every_n_frames: int) -> list[d
                     gray, scaleFactor=1.1, minNeighbors=3, minSize=(40, 40)
                 )
                 for (x, y, w, h) in (detected if len(detected) else []):
-                    faces.append({"cx": int(x + w // 2), "area": int(w * h)})
+                    faces.append({"cx": int(x + w // 2), "cy": int(y + h // 2), "area": int(w * h)})
             frame_idx += 1
     finally:
         cap.release()
@@ -882,11 +917,14 @@ def _collect_faces_opencv(video_path: str, sample_every_n_frames: int) -> list[d
     return faces
 
 
-def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[int]:
+def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[tuple[int, int]]:
     """
-    Return X center positions of the up to two largest faces found in the video,
-    sorted left to right. Returns [] (no faces), [x] (one speaker), or
-    [x_left, x_right] (two speakers).
+    Return (cx, cy) center positions of the up to two largest faces found in the video,
+    sorted left to right. Returns [] (no faces), [(cx, cy)] (one speaker), or
+    [(cx_left, cy_left), (cx_right, cy_right)] (two speakers).
+
+    cy values are averaged across all detections for that speaker to give a stable
+    vertical anchor for crop positioning.
     """
     if _MEDIAPIPE_AVAILABLE:
         try:
@@ -901,17 +939,35 @@ def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[in
         logger.info("No faces detected in %s", video_path)
         return []
 
-    # Sort by area descending, pick up to 2 spatially distinct faces
+    # Sort by area descending, pick up to 2 spatially distinct faces.
+    # For each distinct speaker accumulate all cy samples and average them.
     MIN_X_SEP = 100  # px — faces closer than this are the same person
-    speakers: list[int] = []
+    speaker_cx: list[int] = []
+    speaker_cy_sums: list[list[int]] = []
+
     for face in sorted(faces, key=lambda f: f["area"], reverse=True):
-        if not any(abs(face["cx"] - sx) < MIN_X_SEP for sx in speakers):
-            speakers.append(face["cx"])
-        if len(speakers) == 2:
+        matched = next(
+            (i for i, sx in enumerate(speaker_cx) if abs(face["cx"] - sx) < MIN_X_SEP),
+            None,
+        )
+        if matched is None:
+            speaker_cx.append(face["cx"])
+            speaker_cy_sums.append([face["cy"]])
+        else:
+            speaker_cy_sums[matched].append(face["cy"])
+        if len(speaker_cx) == 2:
             break
 
-    result = sorted(speakers)
-    logger.info("detect_speakers: %d speaker(s) at X=%s in %s", len(result), result, video_path)
+    # Build final list sorted left-to-right with averaged cy
+    raw = [
+        (cx, int(sum(cy_list) / len(cy_list)))
+        for cx, cy_list in zip(speaker_cx, speaker_cy_sums)
+    ]
+    result = sorted(raw, key=lambda p: p[0])
+    logger.info(
+        "detect_speakers: %d speaker(s) at (cx, cy)=%s in %s",
+        len(result), result, video_path,
+    )
     return result
 
 
@@ -919,8 +975,38 @@ def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[in
 # 5. Dynamic crop filter (speaker switching)
 # ---------------------------------------------------------------------------
 
+def _speaker_turn_times(
+    words: list[Word],
+    clip_start: float,
+    clip_end: float,
+) -> list[float]:
+    """
+    Return output-timeline timestamps where the speaker label changes,
+    enforcing SPEAKER_SWITCH_MIN_INTERVAL between consecutive switches.
+    Words must already be in output timeline (t=0 at clip start).
+    Returns [] if no speaker info is present on the words.
+    """
+    clip_words = [w for w in words if clip_start <= w.start <= clip_end and w.speaker]
+    if not clip_words:
+        return []
+
+    turn_times: list[float] = []
+    last_switch = -SPEAKER_SWITCH_MIN_INTERVAL  # allow first switch from t=0
+    current_speaker = clip_words[0].speaker
+
+    for w in clip_words:
+        if w.speaker != current_speaker:
+            t = w.start - clip_start
+            if t - last_switch >= SPEAKER_SWITCH_MIN_INTERVAL:
+                turn_times.append(t)
+                last_switch = t
+            current_speaker = w.speaker  # always update, even if we didn't add the turn
+
+    return turn_times
+
+
 def build_dynamic_crop_filter(
-    speaker_xs: list[int],
+    speaker_positions: list[tuple[int, int]],
     source_w: int,
     source_h: int,
     clip_start: float,
@@ -929,45 +1015,88 @@ def build_dynamic_crop_filter(
 ) -> str:
     """
     Build an FFmpeg crop+scale filter string.
-    With two speakers, switches between their X positions at speech pauses.
-    With one speaker, stays on that face. With none, center crops.
+
+    Framing improvements vs. the old static crop:
+    - Vertical: use FACE_CROP_H_RATIO of source_h as crop height, then shift crop_y
+      so the detected face lands at FACE_Y_TARGET_RATIO from the top of the output
+      frame (not dead-centre).  For two speakers the average cy is used so the frame
+      doesn't jump vertically on speaker switches.
+    - Horizontal: with two speakers, switch on every speaker-turn detected via
+      WhisperX word-level diarization (word.speaker field), enforcing a minimum
+      interval of SPEAKER_SWITCH_MIN_INTERVAL seconds.  Falls back to pause-based
+      switching when no speaker labels are present.
     """
-    crop_w = source_h * 9 // 16
+    # --- Crop dimensions (with zoom-in to allow Y adjustment) ---
+    crop_h = int(source_h * FACE_CROP_H_RATIO)
+    crop_w = crop_h * 9 // 16
+    # Clamp to source bounds (handles portrait or square sources)
+    crop_h = min(crop_h, source_h)
+    crop_w = min(crop_w, source_w)
 
     def clamp_x(cx: int) -> int:
         return max(0, min(source_w - crop_w, cx - crop_w // 2))
 
-    if not speaker_xs:
+    def face_crop_y(cy: int) -> int:
+        """Shift crop_y so the face appears at FACE_Y_TARGET_RATIO from top."""
+        y = cy - int(FACE_Y_TARGET_RATIO * crop_h)
+        return max(0, min(source_h - crop_h, y))
+
+    # --- No faces: static centre crop ---
+    if not speaker_positions:
         x = (source_w - crop_w) // 2
-        return f"crop={crop_w}:{source_h}:{x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+        y = (source_h - crop_h) // 2
+        return f"crop={crop_w}:{crop_h}:{x}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
-    if len(speaker_xs) == 1:
-        x = clamp_x(speaker_xs[0])
-        return f"crop={crop_w}:{source_h}:{x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+    # --- One speaker: static crop centred on face ---
+    if len(speaker_positions) == 1:
+        cx, cy = speaker_positions[0]
+        x = clamp_x(cx)
+        y = face_crop_y(cy)
+        return f"crop={crop_w}:{crop_h}:{x}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
-    # Two speakers — switch on speech pauses
-    x0, x1 = clamp_x(speaker_xs[0]), clamp_x(speaker_xs[1])
-    clip_words = [w for w in words if clip_start <= w.start <= clip_end]
-    pause_times: list[float] = []
-    for i in range(len(clip_words) - 1):
-        if clip_words[i + 1].start - clip_words[i].end >= SUB_SILENCE_GAP:
-            pause_times.append(clip_words[i].end - clip_start)
+    # --- Two speakers ---
+    (cx0, cy0), (cx1, cy1) = speaker_positions[0], speaker_positions[1]
+    x0, x1 = clamp_x(cx0), clamp_x(cx1)
+    # Use averaged cy for stable vertical framing — no vertical jump on speaker switch
+    avg_cy = (cy0 + cy1) // 2
+    y = face_crop_y(avg_cy)
 
-    if not pause_times:
-        return f"crop={crop_w}:{source_h}:{x0}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+    # Prefer speaker-turn times from diarization; fall back to pause detection
+    switch_times = _speaker_turn_times(words, clip_start, clip_end)
+    if switch_times:
+        logger.info(
+            "switch_crop: %d speaker turn(s) in clip [%.2f–%.2f] (diarization), "
+            "x0=%d x1=%d y=%d",
+            len(switch_times), clip_start, clip_end, x0, x1, y,
+        )
+    else:
+        # Fallback: switch at speech pauses (old behaviour)
+        clip_words = [w for w in words if clip_start <= w.start <= clip_end]
+        last_switch_t = -SPEAKER_SWITCH_MIN_INTERVAL
+        for i in range(len(clip_words) - 1):
+            gap = clip_words[i + 1].start - clip_words[i].end
+            if gap >= SUB_SILENCE_GAP:
+                t = clip_words[i].end - clip_start
+                if t - last_switch_t >= SPEAKER_SWITCH_MIN_INTERVAL:
+                    switch_times.append(t)
+                    last_switch_t = t
+        logger.info(
+            "switch_crop: %d pause-based switch(es) in clip [%.2f–%.2f] (fallback), "
+            "x0=%d x1=%d y=%d",
+            len(switch_times), clip_start, clip_end, x0, x1, y,
+        )
 
-    # Build a nested FFmpeg if(lt(t,T),X,…) expression that toggles x0/x1 at each pause.
+    if not switch_times:
+        return f"crop={crop_w}:{crop_h}:{x0}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+
+    # Build a nested FFmpeg if(lt(t,T),X,…) expression that toggles x0/x1 at each switch.
     # Commas inside if() must be escaped as \, for FFmpeg's filter parser.
     xs = [x0, x1]
-    expr = str(xs[len(pause_times) % 2])
-    for i, t in reversed(list(enumerate(pause_times))):
+    expr = str(xs[len(switch_times) % 2])
+    for i, t in reversed(list(enumerate(switch_times))):
         expr = f"if(lt(t\\,{t:.3f})\\,{xs[i % 2]}\\,{expr})"
 
-    logger.info(
-        "switch_crop: %d pause(s) in clip [%.2f–%.2f], x0=%d x1=%d",
-        len(pause_times), clip_start, clip_end, x0, x1,
-    )
-    return f"crop={crop_w}:{source_h}:{expr}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+    return f"crop={crop_w}:{crop_h}:{expr}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
 
 # ---------------------------------------------------------------------------
@@ -1124,9 +1253,12 @@ def build_subtitle_filters(cards: list[SubtitleCard]) -> list[str]:
     Returns a list of individual drawtext filter strings (not joined),
     so callers can chunk them into batches before passing to FFmpeg.
 
-    Cards whose text cannot be safely escaped are replaced with a
-    sanitised version rather than skipped, so no card is ever silently
-    dropped due to special characters.
+    Each card produces N+1 drawtext filters:
+      1. The full card text in white for the entire card window (base layer).
+      2. One yellow (#FFD700) filter per word, active only during that word's
+         spoken window and positioned over the matching white text.
+
+    Font: Montserrat Bold, size 52, black outline 2px.
     """
     if not cards:
         return []
@@ -1136,20 +1268,52 @@ def build_subtitle_filters(cards: list[SubtitleCard]) -> list[str]:
 
     for card in cards:
         try:
-            text = _escape_drawtext(card.text)
+            full_text = _escape_drawtext(card.text)
             t_start = f"{card.display_start:.3f}"
-            t_end = f"{card.display_end:.3f}"
+            t_end   = f"{card.display_end:.3f}"
+
+            # ── Base layer: full card in white for the entire card window ──
             filters.append(
                 f"drawtext=fontfile={FONT_PATH}"
                 f":fontsize={SUB_FONTSIZE}"
                 f":fontcolor=white"
-                f":text='{text}'"
+                f":text='{full_text}'"
                 f":x=(w-text_w)/2"
                 f":y={sub_y}"
                 f":bordercolor=black"
                 f":borderw={SUB_BORDER_W}"
                 f":enable='between(t\\,{t_start}\\,{t_end})'"
             )
+
+            # ── Per-word yellow highlight overlay ──────────────────────────
+            # Approximate the x offset of each word within the centred card
+            # text using the same heuristic as _measure_text_width so the
+            # yellow glyph lands on top of its white counterpart.
+            total_w = _measure_text_width(card.text, SUB_FONTSIZE)
+            for wi, word in enumerate(card.words):
+                prefix = " ".join(w.text for w in card.words[:wi])
+                if prefix:
+                    prefix += " "   # space between prefix and this word
+                prefix_w = _measure_text_width(prefix, SUB_FONTSIZE)
+                word_x   = f"(w-{total_w})/2+{prefix_w}"
+
+                word_text = _escape_drawtext(word.text)
+                # word.start / word.end are in output timeline (set by flush())
+                wt_start = f"{max(0.0, word.start):.3f}"
+                wt_end   = f"{min(card.display_end, word.end):.3f}"
+
+                filters.append(
+                    f"drawtext=fontfile={FONT_PATH}"
+                    f":fontsize={SUB_FONTSIZE}"
+                    f":fontcolor=#FFD700"
+                    f":text='{word_text}'"
+                    f":x={word_x}"
+                    f":y={sub_y}"
+                    f":bordercolor=black"
+                    f":borderw={SUB_BORDER_W}"
+                    f":enable='between(t\\,{wt_start}\\,{wt_end})'"
+                )
+
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "build_subtitle_filters: skipping card %r (t=%.3f–%.3f) due to "
@@ -1361,7 +1525,7 @@ async def render_clip(
     source_video: str,
     source_w: int,
     source_h: int,
-    detections: list[dict],
+    detections: list[tuple[int, int]],
     output_dir: str,
 ) -> str:
     """
@@ -1385,7 +1549,7 @@ def _render_clip_sync(
     source_video: str,
     source_w: int,
     source_h: int,
-    detections: list[dict],
+    detections: list[tuple[int, int]],
     output_dir: str,
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
@@ -1639,6 +1803,7 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                     start=float(w["start"]),
                     end=float(w["end"]),
                     precise=w.get("precise", True),
+                    speaker=w.get("speaker"),
                 )
                 for w in stored_words
             ]
@@ -1663,6 +1828,7 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                         start=float(w["start"]),
                         end=float(w["end"]),
                         precise=w.get("precise", True),
+                        speaker=w.get("speaker"),
                     )
                     for w in stored_transcript
                 ]
@@ -1693,7 +1859,7 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                 # Persist transcript to DB for retry reuse
                 logger.info("Persisting transcript to DB (%d words)…", len(words))
                 word_dicts = [
-                    {"text": w.text, "start": w.start, "end": w.end, "precise": w.precise}
+                    {"text": w.text, "start": w.start, "end": w.end, "precise": w.precise, "speaker": w.speaker}
                     for w in words
                 ]
                 flat_transcript = " ".join(w.text for w in words)
