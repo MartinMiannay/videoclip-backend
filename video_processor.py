@@ -1828,14 +1828,19 @@ def _render_clip_sync(
         else:
             pre_cta = text_burned
 
-        # --- Step F: append CTA ---
+        # --- Step F: append CTA (classic only) ---
         final = os.path.join(output_dir, f"{spec.clip_id}.mp4")
-        try:
-            append_cta_fast(pre_cta, final)
-        except Exception as exc:
-            logger.warning("CTA append failed (%s), using clip without CTA: %s", spec.clip_id, exc)
+        if subtitle_style == "classic":
+            try:
+                append_cta_fast(pre_cta, final)
+            except Exception as exc:
+                logger.warning("CTA append failed (%s), using clip without CTA: %s", spec.clip_id, exc)
+                import shutil
+                shutil.copy2(pre_cta, final)
+        else:
             import shutil
             shutil.copy2(pre_cta, final)
+            logger.info("Clip %s — CTA skipped for style '%s'", spec.clip_id, subtitle_style)
 
         # Verify output
         if not os.path.exists(final):
