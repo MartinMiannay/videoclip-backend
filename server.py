@@ -8,7 +8,7 @@ import asyncio
 import uuid
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
+from typing import List, Optional  # noqa: F401 — Optional used in endpoint signatures
 from datetime import datetime, timezone
 
 ROOT_DIR = Path(__file__).parent
@@ -276,7 +276,7 @@ async def delete_project(project_id: str):
 
 
 @api_router.post("/projects/{project_id}/process")
-async def start_processing(project_id: str):
+async def start_processing(project_id: str, data: Optional[ProcessRequest] = None):
     project = await db.projects.find_one({"id": project_id}, {"_id": 0})
     if not project:
         raise HTTPException(404, "Project not found")
@@ -293,13 +293,16 @@ async def start_processing(project_id: str):
         )
         raise HTTPException(410, "Video file was lost due to a server restart. Please re-upload your video.")
 
+    subtitle_style = data.subtitle_style if data else "classic"
+
     await db.projects.update_one(
         {"id": project_id},
-        {"$set": {"status": "processing", "processing_step": "starting", "processing_progress": 0, "processing_details": "Starting pipeline..."}}
+        {"$set": {"status": "processing", "processing_step": "starting", "processing_progress": 0,
+                  "processing_details": "Starting pipeline...", "subtitle_style": subtitle_style}}
     )
 
     from video_processor import process_video_pipeline
-    asyncio.create_task(process_video_pipeline(project_id, db))
+    asyncio.create_task(process_video_pipeline(project_id, db, subtitle_style=subtitle_style))
 
     return {"message": "Processing started", "project_id": project_id}
 
@@ -366,6 +369,10 @@ async def stream_project_video(project_id: str):
     return FileResponse(video_path, media_type="video/mp4")
 
 
+class ProcessRequest(BaseModel):
+    subtitle_style: str = "classic"
+
+
 class ManualClip(BaseModel):
     start_seconds: float
     end_seconds: float
@@ -375,6 +382,7 @@ class ManualClip(BaseModel):
 
 class ManualRenderRequest(BaseModel):
     clips: List[ManualClip]
+    subtitle_style: str = "classic"
 
 
 @api_router.post("/projects/{project_id}/render-manual")
@@ -397,7 +405,10 @@ async def render_manual_clips(project_id: str, data: ManualRenderRequest):
     )
 
     from video_processor import render_manual_pipeline
-    asyncio.create_task(render_manual_pipeline(project_id, [c.model_dump() for c in data.clips], db))
+    asyncio.create_task(render_manual_pipeline(
+        project_id, [c.model_dump() for c in data.clips], db,
+        subtitle_style=data.subtitle_style,
+    ))
 
     result = await db.projects.find_one({"id": project_id}, {"_id": 0, "transcript_words": 0})
     result.pop("local_video_path", None)

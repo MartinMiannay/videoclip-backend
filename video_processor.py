@@ -58,12 +58,20 @@ SUB_FONT = "Montserrat-Bold"
 SUB_FONTSIZE = 52
 SUB_BORDER_W = 2          # thin black outline
 SUB_BOX_BORDER = 8        # padding around subtitle background box (px)
-SUB_Y_RATIO = 0.72        # vertical position as fraction of frame height
+SUB_Y_RATIO = 0.72        # vertical position as fraction of frame height (classic)
+SUB_Y_KEO = 0.80          # vertical position for "keo" style (80% from top)
+SUB_Y_TOVARITCH = 0.40    # vertical position for "tovaritch" style (40% from top)
 SUB_SHIFT_MS = 0.100      # shift card 100 ms earlier than word start
 SUB_SILENCE_GAP = 0.3     # gap in seconds that means silence (no card)
 SUB_MIN_CARD_GAP = 0.05   # minimum gap enforced between consecutive subtitle cards
 
 _FILLER_WORDS = {"hm", "hum", "euh", "eh", "mmm", "ah"}  # isolated filler sounds to suppress
+
+# Keo style: French function words rendered at lighter weight
+_KEO_FILLER_WORDS_FR = frozenset({
+    "le", "la", "les", "de", "du", "un", "une", "que", "qui",
+    "et", "en", "à", "au", "par", "sur", "pour", "pas", "ne",
+})
 
 # Set False to skip all drawtext rendering (subtitles + title card).
 # Disable while debugging FFmpeg filter parse errors; re-enable once rendering works.
@@ -106,8 +114,37 @@ if _sys.platform == "win32":
         ASSETS_DIR.mkdir(exist_ok=True)
         _shutil.copy2(_win_font_src, _win_font_dst)
     FONT_PATH = f"assets/{_win_font_name}"  # relative to ROOT_DIR, passed as ffmpeg cwd
+
+    # Arial Regular (keo filler words — lighter weight)
+    _arial_regular_src = Path("C:/Windows/Fonts/arial.ttf")
+    _arial_regular_dst = ASSETS_DIR / "arial.ttf"
+    if not _arial_regular_dst.exists() and _arial_regular_src.exists():
+        import shutil as _shutil2; ASSETS_DIR.mkdir(exist_ok=True)
+        _shutil2.copy2(_arial_regular_src, _arial_regular_dst)
+    FONT_PATH_REGULAR = "assets/arial.ttf" if _arial_regular_dst.exists() else FONT_PATH
+    FONT_PATH_BOLD = FONT_PATH  # Arial Bold / Montserrat Bold already the primary
+
+    # Impact (tovaritch style)
+    _impact_src = Path("C:/Windows/Fonts/impact.ttf")
+    _impact_dst = ASSETS_DIR / "impact.ttf"
+    if not _impact_dst.exists() and _impact_src.exists():
+        import shutil as _shutil3; ASSETS_DIR.mkdir(exist_ok=True)
+        _shutil3.copy2(_impact_src, _impact_dst)
+    FONT_PATH_IMPACT = "assets/impact.ttf" if _impact_dst.exists() else FONT_PATH
 else:
     FONT_PATH = "/usr/share/fonts/truetype/montserrat/Montserrat-Bold.ttf"
+    FONT_PATH_BOLD = FONT_PATH
+    # Liberation Sans Regular is a metric-compatible Arial substitute, included in most distros
+    _liberation_regular = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+    _arial_regular_linux = "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf"
+    if Path(_liberation_regular).exists():
+        FONT_PATH_REGULAR = _liberation_regular
+    elif Path(_arial_regular_linux).exists():
+        FONT_PATH_REGULAR = _arial_regular_linux
+    else:
+        FONT_PATH_REGULAR = FONT_PATH  # fall back to bold — all words bold
+    _impact_linux = "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf"
+    FONT_PATH_IMPACT = _impact_linux if Path(_impact_linux).exists() else FONT_PATH
 
 CLIP_MIN_DURATION = 20   # seconds
 CLIP_MAX_DURATION = 120  # seconds
@@ -1103,6 +1140,27 @@ def build_dynamic_crop_filter(
 
 
 # ---------------------------------------------------------------------------
+# 5b. Disk space guard
+# ---------------------------------------------------------------------------
+
+def _check_workspace_disk_space(min_gb: float = 5.0) -> None:
+    """Raise RuntimeError if /workspace has less than min_gb free. Skip if path absent."""
+    import shutil as _su
+    workspace = "/workspace"
+    try:
+        usage = _su.disk_usage(workspace)
+        free_gb = usage.free / (1024 ** 3)
+        if free_gb < min_gb:
+            raise RuntimeError(
+                f"Insufficient disk space on {workspace}: {free_gb:.1f} GB free, "
+                f"need at least {min_gb:.0f} GB. Free up space and retry."
+            )
+        logger.info("Disk space check OK: %.1f GB free on %s", free_gb, workspace)
+    except FileNotFoundError:
+        logger.info("Disk space check skipped: %s not found (non-RunPod env)", workspace)
+
+
+# ---------------------------------------------------------------------------
 # 6. Title card rendering
 # ---------------------------------------------------------------------------
 
@@ -1182,6 +1240,60 @@ def build_title_card_filter(title: str, duration: float) -> list[str]:
     return filters
 
 
+def build_title_card_filter_keo(title: str, duration: float) -> list[str]:
+    """
+    Keo style title card: clean white floating text, no box/pill, mixed case,
+    Arial/Helvetica Neue, size 52, subtle drop shadow.
+    """
+    display_duration = min(3.0, duration)
+    lines, fontsize = _wrap_title(title, MAX_TITLE_W, 52)
+    line_height = int(fontsize * 1.4)
+    card_top_y = SAFE_MARGIN + 60
+
+    filters: list[str] = []
+    for i, line in enumerate(lines):
+        y = card_top_y + i * line_height
+        filters.append(
+            f"drawtext=fontfile={FONT_PATH_BOLD}"
+            f":fontsize={fontsize}"
+            f":fontcolor=white"
+            f":shadowcolor=black@0.5"
+            f":shadowx=2:shadowy=2"
+            f":text='{_escape_drawtext(line)}'"
+            f":x=(w-text_w)/2"
+            f":y={y}"
+            f":enable='between(t\\,0\\,{display_duration:.3f})'"
+        )
+    return filters
+
+
+def build_title_card_filter_tovaritch(title: str, duration: float) -> list[str]:
+    """
+    Tovaritch style title card: ALL CAPS Impact, first line red #FF2200,
+    second line white, no box/pill, floating on video.
+    """
+    display_duration = min(3.0, duration)
+    lines, fontsize = _wrap_title(title.upper(), MAX_TITLE_W, 76)
+    line_height = int(fontsize * 1.4)
+    card_top_y = int(FRAME_H * 0.35)
+
+    colors = ["#FF2200", "white"]
+    filters: list[str] = []
+    for i, line in enumerate(lines):
+        y = card_top_y + i * line_height
+        color = colors[i % 2]
+        filters.append(
+            f"drawtext=fontfile={FONT_PATH_IMPACT}"
+            f":fontsize={fontsize}"
+            f":fontcolor={color}"
+            f":text='{_escape_drawtext(line)}'"
+            f":x=(w-text_w)/2"
+            f":y={y}"
+            f":enable='between(t\\,0\\,{display_duration:.3f})'"
+        )
+    return filters
+
+
 # ---------------------------------------------------------------------------
 # 7. Subtitle drawtext filters
 # ---------------------------------------------------------------------------
@@ -1247,6 +1359,87 @@ def build_subtitle_filters(cards: list[SubtitleCard]) -> list[str]:
                 "build_subtitle_filters: skipping card %r (t=%.3f–%.3f) — %s",
                 card.text, card.display_start, card.display_end, exc,
             )
+
+    return filters
+
+
+def _is_keo_filler(word: str) -> bool:
+    return word.lower().strip(".,!?…\"'\u2019") in _KEO_FILLER_WORDS_FR
+
+
+def build_subtitle_filters_keo(cards: list[SubtitleCard]) -> list[str]:
+    """
+    Keo style subtitles: per-word bold/regular, no box/outline, drop shadow,
+    Arial, size 52, positioned at 80% from top.
+    French function words → regular weight; nouns/verbs/numbers/adjectives → bold.
+    """
+    if not cards:
+        return []
+
+    sub_y = int(FRAME_H * SUB_Y_KEO)
+    space_w = int(52 * 0.28)  # approximate space width at fontsize 52
+    filters: list[str] = []
+
+    for card in cards:
+        t_start = f"{card.display_start:.3f}"
+        t_end = f"{card.display_end:.3f}"
+        words = card.words
+
+        # Compute per-word font and width
+        word_data: list[tuple[str, str, int]] = []
+        for w in words:
+            font = FONT_PATH_REGULAR if _is_keo_filler(w.text) else FONT_PATH_BOLD
+            width = _measure_text_width(w.text, 52)
+            word_data.append((w.text, font, width))
+
+        total_w = sum(wd[2] for wd in word_data) + space_w * max(0, len(word_data) - 1)
+        current_x = max(SAFE_MARGIN, (FRAME_W - total_w) // 2)
+
+        for word_text, font_path, word_width in word_data:
+            text_escaped = _escape_drawtext(word_text)
+            filters.append(
+                f"drawtext=fontfile={font_path}"
+                f":fontsize=52"
+                f":fontcolor=white"
+                f":shadowcolor=black@0.5"
+                f":shadowx=2:shadowy=2"
+                f":text='{text_escaped}'"
+                f":x={current_x}"
+                f":y={sub_y}"
+                f":enable='between(t\\,{t_start}\\,{t_end})'"
+            )
+            current_x += word_width + space_w
+
+    return filters
+
+
+def build_subtitle_filters_tovaritch(cards: list[SubtitleCard]) -> list[str]:
+    """
+    Tovaritch style subtitles: ALL CAPS Impact size 76, no box/outline,
+    alternating red (#FF2200) / white per card, centered at 40% from top.
+    """
+    if not cards:
+        return []
+
+    sub_y = int(FRAME_H * SUB_Y_TOVARITCH)
+    filters: list[str] = []
+
+    for idx, card in enumerate(cards):
+        t_start = f"{card.display_start:.3f}"
+        t_end = f"{card.display_end:.3f}"
+        # Questions always red; otherwise alternate red/white
+        is_question = card.text.strip().endswith("?")
+        color = "#FF2200" if (idx % 2 == 0 or is_question) else "white"
+        text = _escape_drawtext(card.text.upper())
+        filters.append(
+            f"drawtext=fontfile={FONT_PATH_IMPACT}"
+            f":fontsize=76"
+            f":fontcolor={color}"
+            f":text='{text}'"
+            f":x=(w-text_w)/2"
+            f":y={sub_y}"
+            f":enable='between(t\\,{t_start}\\,{t_end})'"
+        )
 
     return filters
 
@@ -1454,6 +1647,7 @@ async def render_clip(
     source_h: int,
     detections: list[tuple[int, int]],
     output_dir: str,
+    subtitle_style: str = "classic",
 ) -> str:
     """
     Render one clip to disk.  Returns the path to the final .mp4 file.
@@ -1461,14 +1655,15 @@ async def render_clip(
     Steps:
       a) Trim source video to clip window
       b) Apply dynamic crop → 1080×1920
-      c) Burn subtitle cards
+      c) Burn subtitle cards (style: classic / keo / tovaritch)
       d) Overlay title card
-      e) Mix background music (ducked under speech)
+      e) Mix background music (ducked under speech; skipped for tovaritch)
       f) Append CTA outro
     """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _render_clip_sync, spec, source_video,
-                                      source_w, source_h, detections, output_dir)
+                                      source_w, source_h, detections, output_dir,
+                                      subtitle_style)
 
 
 def _render_clip_sync(
@@ -1478,6 +1673,7 @@ def _render_clip_sync(
     source_h: int,
     detections: list[tuple[int, int]],
     output_dir: str,
+    subtitle_style: str = "classic",
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     tmp_dir = tempfile.mkdtemp(prefix=f"clip_{spec.clip_id}_")
@@ -1559,8 +1755,15 @@ def _render_clip_sync(
             # keep them as a list and chunk the list — never split a joined string.
             # Title card filters go FIRST so they are always rendered in pass 1
             # against the clean cropped.mp4 with guaranteed t=0 PTS at frame 0.
-            title_filters = build_title_card_filter(spec.title, actual_duration)
-            subtitle_filters = build_subtitle_filters(spec.subtitle_cards)
+            if subtitle_style == "keo":
+                title_filters = build_title_card_filter_keo(spec.title, actual_duration)
+                subtitle_filters = build_subtitle_filters_keo(spec.subtitle_cards)
+            elif subtitle_style == "tovaritch":
+                title_filters = build_title_card_filter_tovaritch(spec.title, actual_duration)
+                subtitle_filters = build_subtitle_filters_tovaritch(spec.subtitle_cards)
+            else:  # "classic" and any unknown value
+                title_filters = build_title_card_filter(spec.title, actual_duration)
+                subtitle_filters = build_subtitle_filters(spec.subtitle_cards)
             logger.info(
                 "Clip %s — title card: %d filter(s), subtitles: %d filter(s)",
                 spec.clip_id, len(title_filters), len(subtitle_filters),
@@ -1601,7 +1804,8 @@ def _render_clip_sync(
             _shutil.copy2(cropped, text_burned)
 
         # --- Step E: mix background music ---
-        music_track = pick_music_track(title=spec.title, hook=spec.hook)
+        # Tovaritch style keeps original audio only — skip music entirely.
+        music_track = None if subtitle_style == "tovaritch" else pick_music_track(title=spec.title, hook=spec.hook)
         if music_track:
             with_music = os.path.join(tmp_dir, "music.mp4")
             _run_ffmpeg([
@@ -1653,7 +1857,11 @@ def _render_clip_sync(
 # 12. Main pipeline orchestrator
 # ---------------------------------------------------------------------------
 
-async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> None:
+async def process_video_pipeline(
+    project_id: str,
+    db: AsyncIOMotorDatabase,
+    subtitle_style: str = "classic",
+) -> None:
     """
     Full pipeline entry point.  Called by server.py via asyncio.create_task().
 
@@ -1691,6 +1899,11 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
 
     output_dir: str | None = None
     try:
+        # ----------------------------------------------------------------
+        # Pre-flight: abort early if /workspace is nearly full
+        # ----------------------------------------------------------------
+        _check_workspace_disk_space(min_gb=5.0)
+
         # ----------------------------------------------------------------
         # Startup disk cleanup — remove stale /tmp/clip_* dirs left by
         # any previously crashed or killed pipeline run.
@@ -1955,7 +2168,7 @@ async def process_video_pipeline(project_id: str, db: AsyncIOMotorDatabase) -> N
                 try:
                     local_path = await render_clip(
                         spec, source_video_path, source_w, source_h,
-                        detections, output_dir,
+                        detections, output_dir, subtitle_style,
                     )
 
                     # Verify before upload
@@ -2105,7 +2318,10 @@ async def transcribe_only_pipeline(project_id: str, db: AsyncIOMotorDatabase) ->
 
 
 async def render_manual_pipeline(
-    project_id: str, manual_clips: list[dict], db: AsyncIOMotorDatabase
+    project_id: str,
+    manual_clips: list[dict],
+    db: AsyncIOMotorDatabase,
+    subtitle_style: str = "classic",
 ) -> None:
     """Render clips with manually specified boundaries.
 
@@ -2243,7 +2459,7 @@ async def render_manual_pipeline(
                 try:
                     local_path = await render_clip(
                         spec, source_video_path, source_w, source_h,
-                        detections, output_dir,
+                        detections, output_dir, subtitle_style,
                     )
                     if not os.path.exists(local_path):
                         raise FileNotFoundError(f"Rendered file missing: {local_path}")
