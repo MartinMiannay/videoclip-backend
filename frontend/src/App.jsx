@@ -266,8 +266,15 @@ function UploadZone({ onUploaded }) {
 
 // ── Project detail panel ────────────────────────────────────────────────────
 
+const SUBTITLE_STYLES = [
+  { value: 'classic', label: 'Classic', desc: 'Montserrat Bold, black outline, bottom' },
+  { value: 'keo',     label: 'Keo',     desc: 'Arial mixed-weight, drop shadow, no box' },
+  { value: 'tovaritch', label: 'Tovaritch', desc: 'Impact ALL CAPS, red & white, no music' },
+]
+
 function ProjectPanel({ project: initial, onDeleted, onUpdated }) {
   const [project, setProject] = useState(initial)
+  const [subtitleStyle, setSubtitleStyle] = useState('classic')
   const intervalRef = useRef()
 
   const poll = useCallback(async () => {
@@ -295,7 +302,11 @@ function ProjectPanel({ project: initial, onDeleted, onUpdated }) {
   }, [project.status, poll])
 
   async function startAutoProcessing() {
-    await fetch(`${API}/api/projects/${project.id}/process`, { method: 'POST' })
+    await fetch(`${API}/api/projects/${project.id}/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subtitle_style: subtitleStyle }),
+    })
     setProject(p => ({ ...p, status: 'processing', processing_step: 'starting', processing_progress: 0 }))
   }
 
@@ -354,6 +365,35 @@ function ProjectPanel({ project: initial, onDeleted, onUpdated }) {
       {/* Mode selection — shown when video is uploaded but not yet started */}
       {project.status === 'uploaded' && (
         <div style={{ marginTop: 20 }}>
+          {/* Style selector */}
+          <div style={{ marginBottom: 18 }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: '#555', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>
+              Subtitle Style
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              {SUBTITLE_STYLES.map(st => (
+                <button
+                  key={st.value}
+                  onClick={() => setSubtitleStyle(st.value)}
+                  style={{
+                    flex: 1,
+                    padding: '10px 12px',
+                    borderRadius: 7,
+                    border: `1px solid ${subtitleStyle === st.value ? '#6c8fff' : '#2a2a2a'}`,
+                    background: subtitleStyle === st.value ? '#1a1f2e' : '#161616',
+                    color: subtitleStyle === st.value ? '#c5d0ff' : '#777',
+                    cursor: 'pointer',
+                    textAlign: 'left',
+                    transition: 'all .15s',
+                  }}
+                >
+                  <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 2 }}>{st.label}</div>
+                  <div style={{ fontSize: 11, opacity: 0.7 }}>{st.desc}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+
           <div style={{ fontSize: 13, color: '#888', marginBottom: 14 }}>
             How do you want to select clips?
           </div>
