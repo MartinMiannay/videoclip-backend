@@ -25,18 +25,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import traceback
+
 import anthropic
-try:
-    import mediapipe as mp
-    from mediapipe.tasks import python as _mp_python
-    from mediapipe.tasks.python import vision as _mp_vision
-    _MEDIAPIPE_AVAILABLE = True
-except Exception as _mp_err:
-    logging.getLogger(__name__).warning(
-        "MediaPipe unavailable (%s) — falling back to OpenCV Haar cascade face detection",
-        _mp_err,
-    )
-    _MEDIAPIPE_AVAILABLE = False
 import whisperx
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -88,12 +79,6 @@ SPEAKER_SWITCH_MIN_INTERVAL = 2.0  # minimum seconds between camera switches
 ROOT_DIR = Path(__file__).parent
 MUSIC_DIR = ROOT_DIR / "music"
 ASSETS_DIR = ROOT_DIR / "assets"
-
-_FACE_MODEL_PATH = ROOT_DIR / "blaze_face_short_range.tflite"
-_FACE_MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/face_detector/"
-    "blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
-)
 
 CTA_PATH = ASSETS_DIR / "cta_outro.mov"
 CTA_PREENCODED_PATH = ASSETS_DIR / "cta_preencoded.mp4"
@@ -880,56 +865,8 @@ def trim_clip_silences(
 
 
 # ---------------------------------------------------------------------------
-# 4. Face / speaker detection (MediaPipe)
+# 4. Face / speaker detection (OpenCV Haar cascade)
 # ---------------------------------------------------------------------------
-
-def _ensure_face_model() -> None:
-    if not _FACE_MODEL_PATH.exists():
-        import urllib.request
-        logger.info("Downloading mediapipe face detection model to %s", _FACE_MODEL_PATH)
-        urllib.request.urlretrieve(_FACE_MODEL_URL, _FACE_MODEL_PATH)
-
-
-def _collect_faces_mediapipe(video_path: str, sample_every_n_frames: int) -> list[dict]:
-    """Collect all face detections across sampled frames. Returns [{cx, area}, ...]."""
-    import cv2
-
-    _ensure_face_model()
-    detector = _mp_vision.FaceDetector.create_from_options(
-        _mp_vision.FaceDetectorOptions(
-            base_options=_mp_python.BaseOptions(model_asset_path=str(_FACE_MODEL_PATH)),
-            min_detection_confidence=FACE_CONF_THRESHOLD,
-        )
-    )
-
-    cap = cv2.VideoCapture(video_path)
-    faces: list[dict] = []
-    frame_idx = 0
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if frame_idx % sample_every_n_frames == 0:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                result = detector.detect(mp_image)
-                if result.detections:
-                    for det in result.detections:
-                        bbox = det.bounding_box
-                        faces.append({
-                            "cx": bbox.origin_x + bbox.width // 2,
-                            "cy": bbox.origin_y + bbox.height // 2,
-                            "area": bbox.width * bbox.height,
-                        })
-            frame_idx += 1
-    finally:
-        cap.release()
-        detector.close()
-
-    return faces
-
 
 def _collect_faces_opencv(video_path: str, sample_every_n_frames: int) -> list[dict]:
     """Collect all face detections across sampled frames. Returns [{cx, area}, ...]."""
@@ -969,14 +906,7 @@ def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[tu
     cy values are averaged across all detections for that speaker to give a stable
     vertical anchor for crop positioning.
     """
-    if _MEDIAPIPE_AVAILABLE:
-        try:
-            faces = _collect_faces_mediapipe(video_path, sample_every_n_frames)
-        except Exception as e:
-            logger.warning("MediaPipe face detection failed (%s), falling back to OpenCV", e)
-            faces = _collect_faces_opencv(video_path, sample_every_n_frames)
-    else:
-        faces = _collect_faces_opencv(video_path, sample_every_n_frames)
+    faces = _collect_faces_opencv(video_path, sample_every_n_frames)
 
     if not faces:
         logger.info("No faces detected in %s", video_path)
@@ -1023,28 +953,17 @@ def _detect_face_track_on_clip(
     sample_every_n_frames: int = 30,
 ) -> list[tuple[float, int, int]]:
     """
-    Run face detection on a trimmed clip every N frames.
+    Run face detection on a trimmed clip every N frames using OpenCV Haar cascade.
     Returns [(timestamp_sec, cx, cy), ...] only for frames where a face was detected.
-    Uses MediaPipe if available, falls back to OpenCV Haar cascade.
     """
     import cv2
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     results: list[tuple[float, int, int]] = []
     frame_idx = 0
-
-    if _MEDIAPIPE_AVAILABLE:
-        _ensure_face_model()
-        detector = _mp_vision.FaceDetector.create_from_options(
-            _mp_vision.FaceDetectorOptions(
-                base_options=_mp_python.BaseOptions(model_asset_path=str(_FACE_MODEL_PATH)),
-                min_detection_confidence=FACE_CONF_THRESHOLD,
-            )
-        )
-    else:
-        frontal_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
+    frontal_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
 
     try:
         while True:
@@ -1053,35 +972,17 @@ def _detect_face_track_on_clip(
                 break
             if frame_idx % sample_every_n_frames == 0:
                 t = frame_idx / fps
-                if _MEDIAPIPE_AVAILABLE:
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                    det = detector.detect(mp_img)
-                    if det.detections:
-                        best = max(
-                            det.detections,
-                            key=lambda d: d.bounding_box.width * d.bounding_box.height,
-                        )
-                        bbox = best.bounding_box
-                        results.append((
-                            t,
-                            bbox.origin_x + bbox.width // 2,
-                            bbox.origin_y + bbox.height // 2,
-                        ))
-                else:
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    gray = cv2.equalizeHist(gray)
-                    detected = frontal_cascade.detectMultiScale(
-                        gray, scaleFactor=1.1, minNeighbors=3, minSize=(40, 40)
-                    )
-                    if len(detected):
-                        x, y, fw, fh = max(detected, key=lambda d: d[2] * d[3])
-                        results.append((t, int(x + fw // 2), int(y + fh // 2)))
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.equalizeHist(gray)
+                detected = frontal_cascade.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=3, minSize=(40, 40)
+                )
+                if len(detected):
+                    x, y, fw, fh = max(detected, key=lambda d: d[2] * d[3])
+                    results.append((t, int(x + fw // 2), int(y + fh // 2)))
             frame_idx += 1
     finally:
         cap.release()
-        if _MEDIAPIPE_AVAILABLE:
-            detector.close()
 
     return results
 
@@ -2401,9 +2302,14 @@ async def process_video_pipeline(
                     logger.info("Clip %d/%d done: %s", idx + 1, total, spec.clip_id)
 
                 except Exception as exc:
-                    logger.exception("Clip %s failed: %s", spec.clip_id, exc)
+                    tb = traceback.format_exc()
+                    logger.error("Clip %s FAILED:\n%s", spec.clip_id, tb)
+                    print(f"[CLIP ERROR] {spec.clip_id}:\n{tb}", flush=True)
+                    _debug_path = Path(__file__).parent / "pipeline_error.txt"
+                    with open(_debug_path, "a", encoding="utf-8") as _f:
+                        _f.write(f"\n=== clip {spec.clip_id} (project {project_id}) ===\n{tb}")
                     await update_clip(
-                        spec.clip_id, status="error", error=str(exc)[:500]
+                        spec.clip_id, status="error", error=tb[-1000:]
                     )
                 finally:
                     local = os.path.join(output_dir, f"{spec.clip_id}.mp4")
@@ -2435,12 +2341,12 @@ async def process_video_pipeline(
         )
 
     except Exception as exc:
-        import traceback as _tb
+        tb = traceback.format_exc()
         _debug_path = Path(__file__).parent / "pipeline_error.txt"
         with open(_debug_path, "a", encoding="utf-8") as _f:
-            _f.write(f"\n=== {project_id} ===\n")
-            _f.write(_tb.format_exc())
-        logger.exception("Fatal error in process_video_pipeline for %s: %s", project_id, exc)
+            _f.write(f"\n=== {project_id} ===\n{tb}")
+        logger.error("Fatal error in process_video_pipeline for %s:\n%s", project_id, tb)
+        print(f"[PIPELINE ERROR] {project_id}:\n{tb}", flush=True)
         await set_progress("error", 0, str(exc)[:300], status="error")
 
     finally:
@@ -2684,8 +2590,13 @@ async def render_manual_pipeline(
                     await set_progress("rendering", progress, f"{done_count}/{total} clips prêts")
                     logger.info("Manual clip %d/%d done: %s", idx + 1, total, spec.clip_id)
                 except Exception as exc:
-                    logger.exception("Manual clip %s failed: %s", spec.clip_id, exc)
-                    await update_clip(spec.clip_id, status="error", error=str(exc)[:500])
+                    tb = traceback.format_exc()
+                    logger.error("Manual clip %s FAILED:\n%s", spec.clip_id, tb)
+                    print(f"[MANUAL CLIP ERROR] {spec.clip_id}:\n{tb}", flush=True)
+                    _debug_path = Path(__file__).parent / "pipeline_error.txt"
+                    with open(_debug_path, "a", encoding="utf-8") as _f:
+                        _f.write(f"\n=== manual clip {spec.clip_id} (project {project_id}) ===\n{tb}")
+                    await update_clip(spec.clip_id, status="error", error=tb[-1000:])
                 finally:
                     local = os.path.join(output_dir, f"{spec.clip_id}.mp4")
                     if os.path.exists(local):
