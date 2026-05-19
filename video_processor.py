@@ -61,7 +61,7 @@ SUB_BOX_BORDER = 8        # padding around subtitle background box (px)
 SUB_Y_RATIO = 0.72        # vertical position as fraction of frame height (classic)
 SUB_Y_KEO = 0.80          # vertical position for "keo" style (80% from top)
 SUB_Y_TOVARITCH = 0.40    # vertical position for "tovaritch" style (40% from top)
-SUB_SHIFT_MS = 0.100      # shift card 100 ms earlier than word start
+SUB_SHIFT_MS = 0.0        # no pre-display shift — eliminates card-boundary overlap
 SUB_SILENCE_GAP = 0.3     # gap in seconds that means silence (no card)
 SUB_MIN_CARD_GAP = 0.05   # minimum gap enforced between consecutive subtitle cards
 
@@ -445,8 +445,6 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
     def flush(grp: list[Word]) -> None:
         if not grp:
             return
-        # Convert word timestamps to output timeline so per-word highlight
-        # filters have consistent timing with display_start / display_end.
         output_words = [
             Word(text=w.text, start=w.start - clip_start, end=w.end - clip_start, precise=w.precise)
             for w in grp
@@ -475,11 +473,19 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
 
     flush(group)
 
-    # Enforce minimum gap between consecutive cards to prevent overlap
+    # Pass 1: push each card's display_start forward if it would overlap the previous card.
     for i in range(1, len(cards)):
         min_start = cards[i - 1].display_end + SUB_MIN_CARD_GAP
         if cards[i].display_start < min_start:
             cards[i].display_start = min_start
+
+    # Pass 2: also clamp each card's display_end so it never reaches the next card.
+    # This prevents any between(t,X,Y) window from overlapping the next card's window,
+    # which is the root cause of duplicate-word glitches at card boundaries.
+    for i in range(len(cards) - 1):
+        max_end = cards[i + 1].display_start - SUB_MIN_CARD_GAP
+        if cards[i].display_end > max_end:
+            cards[i].display_end = max(cards[i].display_start + 0.05, max_end)
 
     return cards
 
@@ -1080,7 +1086,12 @@ def _detect_face_track_on_clip(
     return results
 
 
-def build_clip_crop_filter(video_path: str, source_w: int, source_h: int) -> str:
+def build_clip_crop_filter(
+    video_path: str,
+    source_w: int,
+    source_h: int,
+    focus_zone: str = "center",
+) -> str:
     """
     Build a 9:16 crop+scale filter with smooth horizontal face tracking.
 
@@ -1088,29 +1099,46 @@ def build_clip_crop_filter(video_path: str, source_w: int, source_h: int) -> str
     - Smooths detected cx positions with a ±2 sample moving average
     - Builds a piecewise-linear x expression so the crop follows the face
     - Anchors the face at FACE_Y_TARGET_RATIO (25%) from the top vertically
-    - Falls back to centered crop if no face is detected
+    - Falls back to focus_zone-biased crop if no face is detected
+    - Scales the source up before cropping when it is too narrow to fill 9:16
     """
     track = _detect_face_track_on_clip(video_path)
     logger.info("build_clip_crop_filter: %d face sample(s) in %s", len(track), video_path)
 
-    # Crop window: zoom-in to allow vertical adjustment without black bars
-    crop_h = int(source_h * FACE_CROP_H_RATIO)
-    crop_w = crop_h * 9 // 16
-    crop_h = min(crop_h, source_h)
-    crop_w = min(crop_w, source_w)
+    # Crop window in exact 9:16; make both dimensions even (H.264 requirement).
+    crop_h = int(source_h * FACE_CROP_H_RATIO) & ~1
+    crop_w = (crop_h * 9 // 16) & ~1
+
+    # If the source is too narrow to fill crop_w, scale it up first so the crop
+    # always covers exactly crop_w × crop_h pixels with no black borders.
+    if crop_w > source_w:
+        scale_factor = crop_w / source_w
+        scaled_h = int(source_h * scale_factor) & ~1
+        pre_scale = f"scale={crop_w}:{scaled_h}:flags=lanczos,"
+        eff_w, eff_h = crop_w, scaled_h
+        track = [(t, int(cx * scale_factor), int(cy * scale_factor)) for t, cx, cy in track]
+    else:
+        pre_scale = ""
+        eff_w, eff_h = source_w, source_h
+
+    crop_h = min(crop_h, eff_h) & ~1
 
     def clamp_x(cx: int) -> int:
-        return max(0, min(source_w - crop_w, cx - crop_w // 2))
+        return max(0, min(eff_w - crop_w, cx - crop_w // 2))
 
     def face_y(cy: int) -> int:
         y = cy - int(FACE_Y_TARGET_RATIO * crop_h)
-        return max(0, min(source_h - crop_h, y))
+        return max(0, min(eff_h - crop_h, y))
 
     if not track:
-        # No face detected: center crop, top-biased vertically
-        cx = (source_w - crop_w) // 2
-        logger.info("build_clip_crop_filter: no face → center crop x=%d", cx)
-        return f"crop={crop_w}:{crop_h}:{cx}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+        if focus_zone == "left":
+            x = 0
+        elif focus_zone == "right":
+            x = max(0, eff_w - crop_w)
+        else:
+            x = max(0, (eff_w - crop_w) // 2)
+        logger.info("build_clip_crop_filter: no face → %s crop x=%d", focus_zone, x)
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
     # Stable vertical anchor: average cy across all samples
     avg_cy = int(sum(t[2] for t in track) / len(track))
@@ -1130,7 +1158,7 @@ def build_clip_crop_filter(video_path: str, source_w: int, source_h: int) -> str
 
     if len(track) == 1:
         logger.info("build_clip_crop_filter: 1 sample → static crop x=%d y=%d", xs[0], y)
-        return f"crop={crop_w}:{crop_h}:{xs[0]}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{xs[0]}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
     # Build piecewise-linear FFmpeg expression for x (uses \, to escape commas)
     # For each interval [t_i, t_{i+1}]: x_i + (x_{i+1}-x_i)*(t-t_i)/(t_{i+1}-t_i)
@@ -1149,7 +1177,7 @@ def build_clip_crop_filter(video_path: str, source_w: int, source_h: int) -> str
         expr = f"if(lt(t\\,{t1:.3f})\\,{segment}\\,{expr})"
 
     logger.info("build_clip_crop_filter: tracking expr len=%d y=%d", len(expr), y)
-    return f"crop={crop_w}:{crop_h}:{expr}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+    return f"{pre_scale}crop={crop_w}:{crop_h}:{expr}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
 
 # ---------------------------------------------------------------------------
@@ -1193,6 +1221,7 @@ def build_dynamic_crop_filter(
     clip_start: float,
     clip_end: float,
     words: list[Word],
+    focus_zone: str = "center",
 ) -> str:
     """
     Build an FFmpeg crop+scale filter string.
@@ -1207,45 +1236,56 @@ def build_dynamic_crop_filter(
       interval of SPEAKER_SWITCH_MIN_INTERVAL seconds.  Falls back to pause-based
       switching when no speaker labels are present.
     """
-    # --- Crop dimensions (with zoom-in to allow Y adjustment) ---
-    crop_h = int(source_h * FACE_CROP_H_RATIO)
-    crop_w = crop_h * 9 // 16
-    # Clamp to source bounds (handles portrait or square sources)
-    crop_h = min(crop_h, source_h)
-    crop_w = min(crop_w, source_w)
+    # --- Crop dimensions: exact 9:16, even pixel count ---
+    crop_h = int(source_h * FACE_CROP_H_RATIO) & ~1
+    crop_w = (crop_h * 9 // 16) & ~1
+
+    # Scale source up if it is too narrow to fill the 9:16 crop window.
+    if crop_w > source_w:
+        scale_factor = crop_w / source_w
+        scaled_h = int(source_h * scale_factor) & ~1
+        pre_scale = f"scale={crop_w}:{scaled_h}:flags=lanczos,"
+        eff_w, eff_h = crop_w, scaled_h
+        speaker_positions = [
+            (int(cx * scale_factor), int(cy * scale_factor))
+            for cx, cy in speaker_positions
+        ]
+    else:
+        pre_scale = ""
+        eff_w, eff_h = source_w, source_h
+
+    crop_h = min(crop_h, eff_h) & ~1
 
     def clamp_x(cx: int) -> int:
-        return max(0, min(source_w - crop_w, cx - crop_w // 2))
+        return max(0, min(eff_w - crop_w, cx - crop_w // 2))
 
     def face_crop_y(cy: int) -> int:
-        """Shift crop_y so the face appears at FACE_Y_TARGET_RATIO from top."""
         y = cy - int(FACE_Y_TARGET_RATIO * crop_h)
-        return max(0, min(source_h - crop_h, y))
+        return max(0, min(eff_h - crop_h, y))
 
-    # --- No faces: crop top 75 % of frame, centred horizontally ---
-    # Assumes faces (when not detected) are in the upper portion of the shot.
+    # --- No faces: use focus_zone to position crop horizontally ---
     if not speaker_positions:
-        nf_h = int(source_h * 0.75)
-        nf_w = nf_h * 9 // 16
-        nf_w = min(nf_w, source_w)
-        nf_x = max(0, (source_w - nf_w) // 2)
-        return f"crop={nf_w}:{nf_h}:{nf_x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+        if focus_zone == "left":
+            nf_x = 0
+        elif focus_zone == "right":
+            nf_x = max(0, eff_w - crop_w)
+        else:
+            nf_x = max(0, (eff_w - crop_w) // 2)
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{nf_x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
     # --- One speaker: static crop centred on face ---
     if len(speaker_positions) == 1:
         cx, cy = speaker_positions[0]
         x = clamp_x(cx)
         y = face_crop_y(cy)
-        return f"crop={crop_w}:{crop_h}:{x}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{x}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
     # --- Two speakers ---
     (cx0, cy0), (cx1, cy1) = speaker_positions[0], speaker_positions[1]
     x0, x1 = clamp_x(cx0), clamp_x(cx1)
-    # Use averaged cy for stable vertical framing — no vertical jump on speaker switch
     avg_cy = (cy0 + cy1) // 2
     y = face_crop_y(avg_cy)
 
-    # Prefer speaker-turn times from diarization; fall back to pause detection
     switch_times = _speaker_turn_times(words, clip_start, clip_end)
     if switch_times:
         logger.info(
@@ -1254,7 +1294,6 @@ def build_dynamic_crop_filter(
             len(switch_times), clip_start, clip_end, x0, x1, y,
         )
     else:
-        # Fallback: switch at speech pauses (old behaviour)
         clip_words = [w for w in words if clip_start <= w.start <= clip_end]
         last_switch_t = -SPEAKER_SWITCH_MIN_INTERVAL
         for i in range(len(clip_words) - 1):
@@ -1271,16 +1310,14 @@ def build_dynamic_crop_filter(
         )
 
     if not switch_times:
-        return f"crop={crop_w}:{crop_h}:{x0}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{x0}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
-    # Build a nested FFmpeg if(lt(t,T),X,…) expression that toggles x0/x1 at each switch.
-    # Commas inside if() must be escaped as \, for FFmpeg's filter parser.
     xs = [x0, x1]
     expr = str(xs[len(switch_times) % 2])
     for i, t in reversed(list(enumerate(switch_times))):
         expr = f"if(lt(t\\,{t:.3f})\\,{xs[i % 2]}\\,{expr})"
 
-    return f"crop={crop_w}:{crop_h}:{expr}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+    return f"{pre_scale}crop={crop_w}:{crop_h}:{expr}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
 
 # ---------------------------------------------------------------------------
@@ -1801,6 +1838,7 @@ async def render_clip(
     detections: list[tuple[int, int]],
     output_dir: str,
     subtitle_style: str = "classic",
+    focus_zone: str = "center",
 ) -> str:
     """
     Render one clip to disk.  Returns the path to the final .mp4 file.
@@ -1816,7 +1854,7 @@ async def render_clip(
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _render_clip_sync, spec, source_video,
                                       source_w, source_h, detections, output_dir,
-                                      subtitle_style)
+                                      subtitle_style, focus_zone)
 
 
 def _render_clip_sync(
@@ -1827,6 +1865,7 @@ def _render_clip_sync(
     detections: list[tuple[int, int]],
     output_dir: str,
     subtitle_style: str = "classic",
+    focus_zone: str = "center",
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     tmp_dir = tempfile.mkdtemp(prefix=f"clip_{spec.clip_id}_")
@@ -1869,7 +1908,7 @@ def _render_clip_sync(
         # Run face detection on the trimmed clip for accurate per-clip tracking.
         # This replaces the old full-video averaged detections with a smooth
         # horizontal follow that anchors the face at 25% from top.
-        crop_filter = build_clip_crop_filter(trimmed, source_w, source_h)
+        crop_filter = build_clip_crop_filter(trimmed, source_w, source_h, focus_zone=focus_zone)
         cropped = os.path.join(tmp_dir, "cropped.mp4")
         _run_ffmpeg([
             "-i", trimmed,
@@ -2027,6 +2066,7 @@ async def process_video_pipeline(
     project_id: str,
     db: AsyncIOMotorDatabase,
     subtitle_style: str = "classic",
+    focus_zone: str = "center",
 ) -> None:
     """
     Full pipeline entry point.  Called by server.py via asyncio.create_task().
@@ -2334,7 +2374,7 @@ async def process_video_pipeline(
                 try:
                     local_path = await render_clip(
                         spec, source_video_path, source_w, source_h,
-                        detections, output_dir, subtitle_style,
+                        detections, output_dir, subtitle_style, focus_zone,
                     )
 
                     # Verify before upload
@@ -2488,6 +2528,7 @@ async def render_manual_pipeline(
     manual_clips: list[dict],
     db: AsyncIOMotorDatabase,
     subtitle_style: str = "classic",
+    focus_zone: str = "center",
 ) -> None:
     """Render clips with manually specified boundaries.
 
@@ -2625,7 +2666,7 @@ async def render_manual_pipeline(
                 try:
                     local_path = await render_clip(
                         spec, source_video_path, source_w, source_h,
-                        detections, output_dir, subtitle_style,
+                        detections, output_dir, subtitle_style, focus_zone,
                     )
                     if not os.path.exists(local_path):
                         raise FileNotFoundError(f"Rendered file missing: {local_path}")

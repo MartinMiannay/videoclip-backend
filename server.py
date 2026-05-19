@@ -294,6 +294,7 @@ async def start_processing(project_id: str, data: Optional[ProcessRequest] = Non
         raise HTTPException(410, "Video file was lost due to a server restart. Please re-upload your video.")
 
     subtitle_style = data.subtitle_style if data else "classic"
+    focus_zone = data.focus_zone if data else "center"
 
     await db.projects.update_one(
         {"id": project_id},
@@ -302,7 +303,7 @@ async def start_processing(project_id: str, data: Optional[ProcessRequest] = Non
     )
 
     from video_processor import process_video_pipeline
-    asyncio.create_task(process_video_pipeline(project_id, db, subtitle_style=subtitle_style))
+    asyncio.create_task(process_video_pipeline(project_id, db, subtitle_style=subtitle_style, focus_zone=focus_zone))
 
     return {"message": "Processing started", "project_id": project_id}
 
@@ -371,6 +372,7 @@ async def stream_project_video(project_id: str):
 
 class ProcessRequest(BaseModel):
     subtitle_style: str = "classic"
+    focus_zone: str = "center"   # "left" | "center" | "right"
 
 
 class ManualClip(BaseModel):
@@ -383,6 +385,7 @@ class ManualClip(BaseModel):
 class ManualRenderRequest(BaseModel):
     clips: List[ManualClip]
     subtitle_style: str = "classic"
+    focus_zone: str = "center"   # "left" | "center" | "right"
 
 
 @api_router.post("/projects/{project_id}/render-manual")
@@ -408,6 +411,7 @@ async def render_manual_clips(project_id: str, data: ManualRenderRequest):
     asyncio.create_task(render_manual_pipeline(
         project_id, [c.model_dump() for c in data.clips], db,
         subtitle_style=data.subtitle_style,
+        focus_zone=data.focus_zone,
     ))
 
     result = await db.projects.find_one({"id": project_id}, {"_id": 0, "transcript_words": 0})
