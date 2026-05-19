@@ -76,6 +76,11 @@ FACE_Y_TARGET_RATIO = 0.25   # target face position from top of output frame (25
 FACE_CROP_H_RATIO = 0.80     # crop height as fraction of source_h — zoom in to allow Y adjustment
 SPEAKER_SWITCH_MIN_INTERVAL = 2.0  # minimum seconds between camera switches
 
+# Crop stabilisation — auto mode only
+FACE_TRACK_SAMPLE_EVERY = 60   # sample face every N frames (≈2 s @ 30 fps)
+FACE_SMOOTH_WINDOW = 10        # rolling-average window applied to raw cx detections
+FACE_MOVE_THRESHOLD = 80       # px — deadband: ignore movements smaller than this
+
 ROOT_DIR = Path(__file__).parent
 MUSIC_DIR = ROOT_DIR / "music"
 ASSETS_DIR = ROOT_DIR / "assets"
@@ -950,7 +955,7 @@ def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[tu
 
 def _detect_face_track_on_clip(
     video_path: str,
-    sample_every_n_frames: int = 30,
+    sample_every_n_frames: int = FACE_TRACK_SAMPLE_EVERY,
 ) -> list[tuple[float, int, int]]:
     """
     Run face detection on a trimmed clip every N frames using OpenCV Haar cascade.
@@ -991,34 +996,35 @@ def build_clip_crop_filter(
     video_path: str,
     source_w: int,
     source_h: int,
-    focus_zone: str = "center",
+    crop_zone: str = "auto",
 ) -> str:
     """
-    Build a 9:16 crop+scale filter with smooth horizontal face tracking.
+    Build a 9:16 crop+scale filter.
 
-    - Samples every 30 frames of the already-trimmed clip
-    - Smooths detected cx positions with a ±2 sample moving average
-    - Builds a piecewise-linear x expression so the crop follows the face
-    - Anchors the face at FACE_Y_TARGET_RATIO (25%) from the top vertically
-    - Falls back to focus_zone-biased crop if no face is detected
-    - Scales the source up before cropping when it is too narrow to fill 9:16
+    crop_zone="auto"   — face-tracking with stabilised follow (default)
+    crop_zone="left"   — fixed left-third crop, zero movement
+    crop_zone="center" — fixed center crop, zero movement
+    crop_zone="right"  — fixed right-third crop, zero movement
+
+    Auto-mode stabilisation:
+    - Samples every FACE_TRACK_SAMPLE_EVERY frames (~2 s @ 30 fps)
+    - Applies rolling average over last FACE_SMOOTH_WINDOW detections
+    - Commits a new position only when face shifts > FACE_MOVE_THRESHOLD px
+      (deadband — crop stays locked until a real camera move is needed)
+    - Falls back to center if no face is detected
     """
-    track = _detect_face_track_on_clip(video_path)
-    logger.info("build_clip_crop_filter: %d face sample(s) in %s", len(track), video_path)
-
     # Crop window in exact 9:16; make both dimensions even (H.264 requirement).
     crop_h = int(source_h * FACE_CROP_H_RATIO) & ~1
     crop_w = (crop_h * 9 // 16) & ~1
 
-    # If the source is too narrow to fill crop_w, scale it up first so the crop
-    # always covers exactly crop_w × crop_h pixels with no black borders.
+    # If the source is too narrow to fill crop_w, scale it up first.
     if crop_w > source_w:
         scale_factor = crop_w / source_w
         scaled_h = int(source_h * scale_factor) & ~1
         pre_scale = f"scale={crop_w}:{scaled_h}:flags=lanczos,"
         eff_w, eff_h = crop_w, scaled_h
-        track = [(t, int(cx * scale_factor), int(cy * scale_factor)) for t, cx, cy in track]
     else:
+        scale_factor = 1.0
         pre_scale = ""
         eff_w, eff_h = source_w, source_h
 
@@ -1031,53 +1037,75 @@ def build_clip_crop_filter(
         y = cy - int(FACE_Y_TARGET_RATIO * crop_h)
         return max(0, min(eff_h - crop_h, y))
 
-    if not track:
-        if focus_zone == "left":
+    # --- Static crop modes: no face detection, no movement ---
+    if crop_zone in ("left", "center", "right"):
+        if crop_zone == "left":
             x = 0
-        elif focus_zone == "right":
+        elif crop_zone == "right":
             x = max(0, eff_w - crop_w)
         else:
             x = max(0, (eff_w - crop_w) // 2)
-        logger.info("build_clip_crop_filter: no face → %s crop x=%d", focus_zone, x)
+        logger.info("build_clip_crop_filter: static %s crop x=%d", crop_zone, x)
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+
+    # --- Auto mode: face detection + stabilised tracking ---
+    track = _detect_face_track_on_clip(video_path)
+    if scale_factor != 1.0:
+        track = [(t, int(cx * scale_factor), int(cy * scale_factor)) for t, cx, cy in track]
+    logger.info("build_clip_crop_filter: %d face sample(s) in %s", len(track), video_path)
+
+    if not track:
+        x = max(0, (eff_w - crop_w) // 2)
+        logger.info("build_clip_crop_filter: no face → center fallback x=%d", x)
         return f"{pre_scale}crop={crop_w}:{crop_h}:{x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
     # Stable vertical anchor: average cy across all samples
     avg_cy = int(sum(t[2] for t in track) / len(track))
     y = face_y(avg_cy)
 
-    # Smooth horizontal positions with a ±2 sample moving average
-    cx_raw = [t[1] for t in track]
-    window = 2
-    cx_smooth = []
-    for i in range(len(cx_raw)):
-        lo = max(0, i - window)
-        hi = min(len(cx_raw), i + window + 1)
-        cx_smooth.append(int(sum(cx_raw[lo:hi]) / (hi - lo)))
+    # Rolling average over last FACE_SMOOTH_WINDOW samples
+    cx_smoothed: list[int] = []
+    for i in range(len(track)):
+        lo = max(0, i - FACE_SMOOTH_WINDOW + 1)
+        cx_smoothed.append(int(sum(track[j][1] for j in range(lo, i + 1)) / (i - lo + 1)))
 
-    xs = [clamp_x(cx) for cx in cx_smooth]
-    times = [t[0] for t in track]
+    # Deadband: only commit a new keyframe when the smoothed position shifts
+    # more than FACE_MOVE_THRESHOLD px from the last committed position.
+    # Sub-threshold movements are ignored — the crop stays locked.
+    committed: list[tuple[float, int]] = []
+    last_cx: int | None = None
+    for i, (t_sample, _, _) in enumerate(track):
+        cx = clamp_x(cx_smoothed[i])
+        if last_cx is None or abs(cx - last_cx) > FACE_MOVE_THRESHOLD:
+            committed.append((t_sample, cx))
+            last_cx = cx
 
-    if len(track) == 1:
-        logger.info("build_clip_crop_filter: 1 sample → static crop x=%d y=%d", xs[0], y)
-        return f"{pre_scale}crop={crop_w}:{crop_h}:{xs[0]}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+    if len(committed) == 1:
+        logger.info(
+            "build_clip_crop_filter: 1 committed position → static crop x=%d y=%d",
+            committed[0][1], y,
+        )
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{committed[0][1]}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
-    # Build piecewise-linear FFmpeg expression for x (uses \, to escape commas)
-    # For each interval [t_i, t_{i+1}]: x_i + (x_{i+1}-x_i)*(t-t_i)/(t_{i+1}-t_i)
-    expr = str(xs[-1])  # hold last value beyond final sample
+    times = [c[0] for c in committed]
+    xs    = [c[1] for c in committed]
+
+    # Piecewise-linear FFmpeg expression for x (uses \, to escape commas inside crop=)
+    expr = str(xs[-1])
     for i in range(len(times) - 2, -1, -1):
-        t0, x0 = times[i], xs[i]
+        t0, x0 = times[i],     xs[i]
         t1, x1 = times[i + 1], xs[i + 1]
         dt = t1 - t0
         if dt <= 0:
             continue
         dx = x1 - x0
-        if dx == 0:
-            segment = str(x0)
-        else:
-            segment = f"({x0}+{dx}*(t-{t0:.3f})/{dt:.3f})"
+        segment = str(x0) if dx == 0 else f"({x0}+{dx}*(t-{t0:.3f})/{dt:.3f})"
         expr = f"if(lt(t\\,{t1:.3f})\\,{segment}\\,{expr})"
 
-    logger.info("build_clip_crop_filter: tracking expr len=%d y=%d", len(expr), y)
+    logger.info(
+        "build_clip_crop_filter: %d committed / %d samples, expr len=%d y=%d",
+        len(committed), len(track), len(expr), y,
+    )
     return f"{pre_scale}crop={crop_w}:{crop_h}:{expr}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
 
@@ -1122,7 +1150,7 @@ def build_dynamic_crop_filter(
     clip_start: float,
     clip_end: float,
     words: list[Word],
-    focus_zone: str = "center",
+    crop_zone: str = "auto",
 ) -> str:
     """
     Build an FFmpeg crop+scale filter string.
@@ -1164,11 +1192,11 @@ def build_dynamic_crop_filter(
         y = cy - int(FACE_Y_TARGET_RATIO * crop_h)
         return max(0, min(eff_h - crop_h, y))
 
-    # --- No faces: use focus_zone to position crop horizontally ---
+    # --- No faces: use crop_zone to position crop horizontally ---
     if not speaker_positions:
-        if focus_zone == "left":
+        if crop_zone == "left":
             nf_x = 0
-        elif focus_zone == "right":
+        elif crop_zone == "right":
             nf_x = max(0, eff_w - crop_w)
         else:
             nf_x = max(0, (eff_w - crop_w) // 2)
@@ -1739,7 +1767,7 @@ async def render_clip(
     detections: list[tuple[int, int]],
     output_dir: str,
     subtitle_style: str = "classic",
-    focus_zone: str = "center",
+    crop_zone: str = "auto",
 ) -> str:
     """
     Render one clip to disk.  Returns the path to the final .mp4 file.
@@ -1755,7 +1783,7 @@ async def render_clip(
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _render_clip_sync, spec, source_video,
                                       source_w, source_h, detections, output_dir,
-                                      subtitle_style, focus_zone)
+                                      subtitle_style, crop_zone)
 
 
 def _render_clip_sync(
@@ -1766,7 +1794,7 @@ def _render_clip_sync(
     detections: list[tuple[int, int]],
     output_dir: str,
     subtitle_style: str = "classic",
-    focus_zone: str = "center",
+    crop_zone: str = "auto",
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     tmp_dir = tempfile.mkdtemp(prefix=f"clip_{spec.clip_id}_")
@@ -1809,7 +1837,7 @@ def _render_clip_sync(
         # Run face detection on the trimmed clip for accurate per-clip tracking.
         # This replaces the old full-video averaged detections with a smooth
         # horizontal follow that anchors the face at 25% from top.
-        crop_filter = build_clip_crop_filter(trimmed, source_w, source_h, focus_zone=focus_zone)
+        crop_filter = build_clip_crop_filter(trimmed, source_w, source_h, crop_zone=crop_zone)
         cropped = os.path.join(tmp_dir, "cropped.mp4")
         _run_ffmpeg([
             "-i", trimmed,
@@ -1967,7 +1995,7 @@ async def process_video_pipeline(
     project_id: str,
     db: AsyncIOMotorDatabase,
     subtitle_style: str = "classic",
-    focus_zone: str = "center",
+    crop_zone: str = "auto",
 ) -> None:
     """
     Full pipeline entry point.  Called by server.py via asyncio.create_task().
@@ -2215,16 +2243,20 @@ async def process_video_pipeline(
             pending_clip_ids = {c["id"] for c in clip_docs}
 
         # ----------------------------------------------------------------
-        # Step 4: Face detection (shared across all clips)
+        # Step 4: Dimensions + optional face detection (auto mode only)
         # ----------------------------------------------------------------
         await set_progress("detecting_speakers", 33, "Détection des visages…")
 
         source_w, source_h = await asyncio.get_event_loop().run_in_executor(
             None, get_video_dimensions, source_video_path
         )
-        detections = await asyncio.get_event_loop().run_in_executor(
-            None, detect_speakers, source_video_path
-        )
+        if crop_zone == "auto":
+            detections = await asyncio.get_event_loop().run_in_executor(
+                None, detect_speakers, source_video_path
+            )
+        else:
+            detections = []
+            logger.info("Skipping full-video face detection (crop_zone=%s)", crop_zone)
 
         # ----------------------------------------------------------------
         # Step 5: Rebuild ClipSpec for pending clips (retry path needs this)
@@ -2275,7 +2307,7 @@ async def process_video_pipeline(
                 try:
                     local_path = await render_clip(
                         spec, source_video_path, source_w, source_h,
-                        detections, output_dir, subtitle_style, focus_zone,
+                        detections, output_dir, subtitle_style, crop_zone,
                     )
 
                     # Verify before upload
@@ -2434,7 +2466,7 @@ async def render_manual_pipeline(
     manual_clips: list[dict],
     db: AsyncIOMotorDatabase,
     subtitle_style: str = "classic",
-    focus_zone: str = "center",
+    crop_zone: str = "auto",
 ) -> None:
     """Render clips with manually specified boundaries.
 
@@ -2549,14 +2581,18 @@ async def render_manual_pipeline(
 
         await projects.update_one({"id": project_id}, {"$set": {"short_clips": clip_docs}})
 
-        # Face detection (shared across all clips)
+        # Dimensions + optional face detection (auto mode only)
         await set_progress("detecting_speakers", 10, "Détection des visages…")
         source_w, source_h = await asyncio.get_event_loop().run_in_executor(
             None, get_video_dimensions, source_video_path
         )
-        detections = await asyncio.get_event_loop().run_in_executor(
-            None, detect_speakers, source_video_path
-        )
+        if crop_zone == "auto":
+            detections = await asyncio.get_event_loop().run_in_executor(
+                None, detect_speakers, source_video_path
+            )
+        else:
+            detections = []
+            logger.info("Skipping full-video face detection (crop_zone=%s)", crop_zone)
 
         # Render all clips in parallel
         await set_progress("rendering", 20, f"Rendu de {len(clip_specs_map)} clips…")
@@ -2572,7 +2608,7 @@ async def render_manual_pipeline(
                 try:
                     local_path = await render_clip(
                         spec, source_video_path, source_w, source_h,
-                        detections, output_dir, subtitle_style, focus_zone,
+                        detections, output_dir, subtitle_style, crop_zone,
                     )
                     if not os.path.exists(local_path):
                         raise FileNotFoundError(f"Rendered file missing: {local_path}")
