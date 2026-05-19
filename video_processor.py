@@ -80,6 +80,7 @@ SPEAKER_SWITCH_MIN_INTERVAL = 2.0  # minimum seconds between camera switches
 FACE_TRACK_SAMPLE_EVERY = 60   # sample face every N frames (≈2 s @ 30 fps)
 FACE_SMOOTH_WINDOW = 10        # rolling-average window applied to raw cx detections
 FACE_MOVE_THRESHOLD = 80       # px — deadband: ignore movements smaller than this
+CROP_TRANSITION_FRAMES = 8     # frames for smooth x-ramp on speaker-turn switch
 
 ROOT_DIR = Path(__file__).parent
 MUSIC_DIR = ROOT_DIR / "music"
@@ -992,32 +993,105 @@ def _detect_face_track_on_clip(
     return results
 
 
+def _get_speaker_turns(words: list[Word]) -> list[tuple[float, str]]:
+    """
+    Extract speaker change-points from words already on the output timeline (t=0 at clip start).
+
+    Returns [(t_start, speaker_label), ...].  The first entry is always the first labeled word
+    (t_start may be > 0 if the clip starts with unlabeled words).  Subsequent entries are added
+    only when the speaker changes AND at least SPEAKER_SWITCH_MIN_INTERVAL seconds have elapsed
+    since the previous entry — so rapid back-and-forth dialog is collapsed to real camera moves.
+
+    Returns [] when no word carries a speaker label (diarization unavailable).
+    """
+    labeled = [w for w in words if w.speaker is not None]
+    if not labeled:
+        return []
+
+    turns: list[tuple[float, str]] = [(labeled[0].start, labeled[0].speaker)]
+    last_t = labeled[0].start
+    current_speaker: str = labeled[0].speaker
+
+    for w in labeled[1:]:
+        if w.speaker != current_speaker:
+            t = w.start
+            if t - last_t >= SPEAKER_SWITCH_MIN_INTERVAL:
+                turns.append((t, w.speaker))
+                last_t = t
+            # Always track the new label even if we didn't add a turn entry,
+            # so a later switch can be measured from the correct speaker.
+            current_speaker = w.speaker
+
+    return turns
+
+
+def _detect_face_at_time(video_path: str, t_seconds: float) -> tuple[int, int] | None:
+    """
+    Detect the largest face at approximately t_seconds in the video using OpenCV Haar cascade.
+
+    Tries a small expanding window of nearby frames (±3, ±6, ±15, ±30 frames) so that a
+    blink or momentary occlusion at the exact target frame doesn't cause a miss.
+    Returns (cx, cy) in source-video pixel space, or None if no face is found in the window.
+    """
+    import cv2
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    target_frame = int(t_seconds * fps)
+    cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    result: tuple[int, int] | None = None
+    for offset in [0, 3, -3, 6, -6, 15, -15, 30, -30]:
+        idx = max(0, target_frame + offset)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        detected = cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=3, minSize=(40, 40)
+        )
+        if len(detected):
+            x, y, fw, fh = max(detected, key=lambda d: d[2] * d[3])
+            result = (int(x + fw // 2), int(y + fh // 2))
+            break
+    cap.release()
+    return result
+
+
 def build_clip_crop_filter(
     video_path: str,
     source_w: int,
     source_h: int,
     crop_zone: str = "auto",
+    words: list[Word] | None = None,
 ) -> str:
     """
-    Build a 9:16 crop+scale filter.
+    Build a 9:16 crop+scale FFmpeg filter string.
 
-    crop_zone="auto"   — face-tracking with stabilised follow (default)
+    crop_zone="auto"   — speaker-diarization driven when words carry speaker labels;
+                         rolling-avg + deadband fallback otherwise
     crop_zone="left"   — fixed left-third crop, zero movement
     crop_zone="center" — fixed center crop, zero movement
     crop_zone="right"  — fixed right-third crop, zero movement
 
-    Auto-mode stabilisation:
+    Auto-mode with diarization (primary path):
+    - Detects the face once at the START of each speaker turn (one call per turn)
+    - Holds the crop completely static for the entire duration of each turn
+    - Enforces SPEAKER_SWITCH_MIN_INTERVAL (2 s) between switches
+    - Applies a CROP_TRANSITION_FRAMES-frame linear ramp on each position switch
+    - If only one speaker turn, the whole clip is a single static crop
+    - Falls back to center crop if face detection returns nothing
+
+    Auto-mode fallback (no diarization):
     - Samples every FACE_TRACK_SAMPLE_EVERY frames (~2 s @ 30 fps)
     - Applies rolling average over last FACE_SMOOTH_WINDOW detections
     - Commits a new position only when face shifts > FACE_MOVE_THRESHOLD px
-      (deadband — crop stays locked until a real camera move is needed)
-    - Falls back to center if no face is detected
     """
-    # Crop window in exact 9:16; make both dimensions even (H.264 requirement).
     crop_h = int(source_h * FACE_CROP_H_RATIO) & ~1
     crop_w = (crop_h * 9 // 16) & ~1
 
-    # If the source is too narrow to fill crop_w, scale it up first.
     if crop_w > source_w:
         scale_factor = crop_w / source_w
         scaled_h = int(source_h * scale_factor) & ~1
@@ -1048,65 +1122,125 @@ def build_clip_crop_filter(
         logger.info("build_clip_crop_filter: static %s crop x=%d", crop_zone, x)
         return f"{pre_scale}crop={crop_w}:{crop_h}:{x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
-    # --- Auto mode: face detection + stabilised tracking ---
-    track = _detect_face_track_on_clip(video_path)
-    if scale_factor != 1.0:
-        track = [(t, int(cx * scale_factor), int(cy * scale_factor)) for t, cx, cy in track]
-    logger.info("build_clip_crop_filter: %d face sample(s) in %s", len(track), video_path)
+    # --- Auto mode ---
+    speaker_turns = _get_speaker_turns(words or [])
 
-    if not track:
-        x = max(0, (eff_w - crop_w) // 2)
-        logger.info("build_clip_crop_filter: no face → center fallback x=%d", x)
-        return f"{pre_scale}crop={crop_w}:{crop_h}:{x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+    if speaker_turns:
+        # ── Diarization path: one face detection per speaker turn ─────────────
+        import cv2
+        _cap = cv2.VideoCapture(video_path)
+        fps = _cap.get(cv2.CAP_PROP_FPS) or 30.0
+        _cap.release()
+        transition_dur = CROP_TRANSITION_FRAMES / fps
 
-    # Stable vertical anchor: average cy across all samples
-    avg_cy = int(sum(t[2] for t in track) / len(track))
-    y = face_y(avg_cy)
+        face_positions: list[tuple[float, int]] = []  # (t_output, x_clamped)
+        y_samples: list[int] = []
 
-    # Rolling average over last FACE_SMOOTH_WINDOW samples
-    cx_smoothed: list[int] = []
-    for i in range(len(track)):
-        lo = max(0, i - FACE_SMOOTH_WINDOW + 1)
-        cx_smoothed.append(int(sum(track[j][1] for j in range(lo, i + 1)) / (i - lo + 1)))
+        for t_turn, _speaker in speaker_turns:
+            raw = _detect_face_at_time(video_path, t_turn)
+            if raw:
+                cx = int(raw[0] * scale_factor)
+                cy = int(raw[1] * scale_factor)
+                face_positions.append((t_turn, clamp_x(cx)))
+                y_samples.append(face_y(cy))
+            else:
+                # No face found: carry the previous committed x forward
+                prev_x = face_positions[-1][1] if face_positions else max(0, (eff_w - crop_w) // 2)
+                face_positions.append((t_turn, prev_x))
 
-    # Deadband: only commit a new keyframe when the smoothed position shifts
-    # more than FACE_MOVE_THRESHOLD px from the last committed position.
-    # Sub-threshold movements are ignored — the crop stays locked.
-    committed: list[tuple[float, int]] = []
-    last_cx: int | None = None
-    for i, (t_sample, _, _) in enumerate(track):
-        cx = clamp_x(cx_smoothed[i])
-        if last_cx is None or abs(cx - last_cx) > FACE_MOVE_THRESHOLD:
-            committed.append((t_sample, cx))
-            last_cx = cx
-
-    if len(committed) == 1:
+        y = int(sum(y_samples) / len(y_samples)) if y_samples else 0
         logger.info(
-            "build_clip_crop_filter: 1 committed position → static crop x=%d y=%d",
-            committed[0][1], y,
+            "build_clip_crop_filter: diarization — %d turn(s), %d face(s) detected, y=%d",
+            len(speaker_turns), len(y_samples), y,
         )
-        return f"{pre_scale}crop={crop_w}:{crop_h}:{committed[0][1]}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
-    times = [c[0] for c in committed]
-    xs    = [c[1] for c in committed]
+        # Collapse consecutive turns that landed on the same x position
+        deduped: list[tuple[float, int]] = []
+        for item in face_positions:
+            if not deduped or item[1] != deduped[-1][1]:
+                deduped.append(item)
 
-    # Piecewise-linear FFmpeg expression for x (uses \, to escape commas inside crop=)
-    expr = str(xs[-1])
-    for i in range(len(times) - 2, -1, -1):
-        t0, x0 = times[i],     xs[i]
-        t1, x1 = times[i + 1], xs[i + 1]
-        dt = t1 - t0
-        if dt <= 0:
-            continue
-        dx = x1 - x0
-        segment = str(x0) if dx == 0 else f"({x0}+{dx}*(t-{t0:.3f})/{dt:.3f})"
-        expr = f"if(lt(t\\,{t1:.3f})\\,{segment}\\,{expr})"
+        if len(deduped) <= 1:
+            x = deduped[0][1] if deduped else max(0, (eff_w - crop_w) // 2)
+            logger.info("build_clip_crop_filter: single position → static x=%d y=%d", x, y)
+            return f"{pre_scale}crop={crop_w}:{crop_h}:{x}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
-    logger.info(
-        "build_clip_crop_filter: %d committed / %d samples, expr len=%d y=%d",
-        len(committed), len(track), len(expr), y,
-    )
-    return f"{pre_scale}crop={crop_w}:{crop_h}:{expr}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+        # Build piecewise FFmpeg expression (right-to-left):
+        #   before t_switch  → hold x0
+        #   t_switch … t_switch+transition_dur → linear ramp x0→x1
+        #   after             → x1 (or next segment)
+        expr = str(deduped[-1][1])
+        for i in range(len(deduped) - 2, -1, -1):
+            _t0, x0 = deduped[i]
+            t1,  x1 = deduped[i + 1]
+            dx = x1 - x0
+            if dx == 0:
+                expr = f"if(lt(t\\,{t1:.3f})\\,{x0}\\,{expr})"
+            else:
+                t_ramp_end = t1 + transition_dur
+                ramp = f"({x0}+{dx}*(t-{t1:.3f})/{transition_dur:.3f})"
+                after_ramp = f"if(lt(t\\,{t_ramp_end:.3f})\\,{ramp}\\,{expr})"
+                expr = f"if(lt(t\\,{t1:.3f})\\,{x0}\\,{after_ramp})"
+
+        logger.info(
+            "build_clip_crop_filter: diarization expr len=%d (%d switch(es), transition=%.2fs)",
+            len(expr), len(deduped) - 1, transition_dur,
+        )
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{expr}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+
+    else:
+        # ── Fallback: rolling-average + deadband (no diarization) ────────────
+        track = _detect_face_track_on_clip(video_path)
+        if scale_factor != 1.0:
+            track = [(t, int(cx * scale_factor), int(cy * scale_factor)) for t, cx, cy in track]
+        logger.info("build_clip_crop_filter: fallback — %d face sample(s)", len(track))
+
+        if not track:
+            x = max(0, (eff_w - crop_w) // 2)
+            logger.info("build_clip_crop_filter: no face → center fallback x=%d", x)
+            return f"{pre_scale}crop={crop_w}:{crop_h}:{x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+
+        avg_cy = int(sum(t[2] for t in track) / len(track))
+        y = face_y(avg_cy)
+
+        cx_smoothed: list[int] = []
+        for i in range(len(track)):
+            lo = max(0, i - FACE_SMOOTH_WINDOW + 1)
+            cx_smoothed.append(int(sum(track[j][1] for j in range(lo, i + 1)) / (i - lo + 1)))
+
+        committed: list[tuple[float, int]] = []
+        last_cx: int | None = None
+        for i, (t_sample, _, _) in enumerate(track):
+            cx = clamp_x(cx_smoothed[i])
+            if last_cx is None or abs(cx - last_cx) > FACE_MOVE_THRESHOLD:
+                committed.append((t_sample, cx))
+                last_cx = cx
+
+        if len(committed) == 1:
+            logger.info(
+                "build_clip_crop_filter: 1 committed position → static x=%d y=%d",
+                committed[0][1], y,
+            )
+            return f"{pre_scale}crop={crop_w}:{crop_h}:{committed[0][1]}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+
+        times = [c[0] for c in committed]
+        xs    = [c[1] for c in committed]
+        expr = str(xs[-1])
+        for i in range(len(times) - 2, -1, -1):
+            t0, x0 = times[i],     xs[i]
+            t1, x1 = times[i + 1], xs[i + 1]
+            dt = t1 - t0
+            if dt <= 0:
+                continue
+            dx = x1 - x0
+            segment = str(x0) if dx == 0 else f"({x0}+{dx}*(t-{t0:.3f})/{dt:.3f})"
+            expr = f"if(lt(t\\,{t1:.3f})\\,{segment}\\,{expr})"
+
+        logger.info(
+            "build_clip_crop_filter: fallback %d committed / %d samples, expr len=%d y=%d",
+            len(committed), len(track), len(expr), y,
+        )
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{expr}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
 
 # ---------------------------------------------------------------------------
@@ -1837,7 +1971,7 @@ def _render_clip_sync(
         # Run face detection on the trimmed clip for accurate per-clip tracking.
         # This replaces the old full-video averaged detections with a smooth
         # horizontal follow that anchors the face at 25% from top.
-        crop_filter = build_clip_crop_filter(trimmed, source_w, source_h, crop_zone=crop_zone)
+        crop_filter = build_clip_crop_filter(trimmed, source_w, source_h, crop_zone=crop_zone, words=spec.words)
         cropped = os.path.join(tmp_dir, "cropped.mp4")
         _run_ffmpeg([
             "-i", trimmed,
