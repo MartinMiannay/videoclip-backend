@@ -61,7 +61,7 @@ SUB_BOX_BORDER = 8        # padding around subtitle background box (px)
 SUB_Y_RATIO = 0.72        # vertical position as fraction of frame height (classic)
 SUB_Y_KEO = 0.80          # vertical position for "keo" style (80% from top)
 SUB_Y_TOVARITCH = 0.40    # vertical position for "tovaritch" style (40% from top)
-SUB_SHIFT_MS = 0.100      # shift card 100 ms earlier than word start
+SUB_SHIFT_MS = 0.0        # no pre-display shift — eliminates card-boundary overlap
 SUB_SILENCE_GAP = 0.3     # gap in seconds that means silence (no card)
 SUB_MIN_CARD_GAP = 0.05   # minimum gap enforced between consecutive subtitle cards
 
@@ -445,8 +445,6 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
     def flush(grp: list[Word]) -> None:
         if not grp:
             return
-        # Convert word timestamps to output timeline so per-word highlight
-        # filters have consistent timing with display_start / display_end.
         output_words = [
             Word(text=w.text, start=w.start - clip_start, end=w.end - clip_start, precise=w.precise)
             for w in grp
@@ -475,11 +473,19 @@ def build_subtitle_cards(words: list[Word], clip_start: float) -> list[SubtitleC
 
     flush(group)
 
-    # Enforce minimum gap between consecutive cards to prevent overlap
+    # Pass 1: push each card's display_start forward if it would overlap the previous card.
     for i in range(1, len(cards)):
         min_start = cards[i - 1].display_end + SUB_MIN_CARD_GAP
         if cards[i].display_start < min_start:
             cards[i].display_start = min_start
+
+    # Pass 2: also clamp each card's display_end so it never reaches the next card.
+    # This prevents any between(t,X,Y) window from overlapping the next card's window,
+    # which is the root cause of duplicate-word glitches at card boundaries.
+    for i in range(len(cards) - 1):
+        max_end = cards[i + 1].display_start - SUB_MIN_CARD_GAP
+        if cards[i].display_end > max_end:
+            cards[i].display_end = max(cards[i].display_start + 0.05, max_end)
 
     return cards
 
@@ -1009,6 +1015,172 @@ def detect_speakers(video_path: str, sample_every_n_frames: int = 15) -> list[tu
 
 
 # ---------------------------------------------------------------------------
+# 4b. Per-clip face tracking (used in render step instead of full-video detection)
+# ---------------------------------------------------------------------------
+
+def _detect_face_track_on_clip(
+    video_path: str,
+    sample_every_n_frames: int = 30,
+) -> list[tuple[float, int, int]]:
+    """
+    Run face detection on a trimmed clip every N frames.
+    Returns [(timestamp_sec, cx, cy), ...] only for frames where a face was detected.
+    Uses MediaPipe if available, falls back to OpenCV Haar cascade.
+    """
+    import cv2
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    results: list[tuple[float, int, int]] = []
+    frame_idx = 0
+
+    if _MEDIAPIPE_AVAILABLE:
+        _ensure_face_model()
+        detector = _mp_vision.FaceDetector.create_from_options(
+            _mp_vision.FaceDetectorOptions(
+                base_options=_mp_python.BaseOptions(model_asset_path=str(_FACE_MODEL_PATH)),
+                min_detection_confidence=FACE_CONF_THRESHOLD,
+            )
+        )
+    else:
+        frontal_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % sample_every_n_frames == 0:
+                t = frame_idx / fps
+                if _MEDIAPIPE_AVAILABLE:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                    det = detector.detect(mp_img)
+                    if det.detections:
+                        best = max(
+                            det.detections,
+                            key=lambda d: d.bounding_box.width * d.bounding_box.height,
+                        )
+                        bbox = best.bounding_box
+                        results.append((
+                            t,
+                            bbox.origin_x + bbox.width // 2,
+                            bbox.origin_y + bbox.height // 2,
+                        ))
+                else:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    gray = cv2.equalizeHist(gray)
+                    detected = frontal_cascade.detectMultiScale(
+                        gray, scaleFactor=1.1, minNeighbors=3, minSize=(40, 40)
+                    )
+                    if len(detected):
+                        x, y, fw, fh = max(detected, key=lambda d: d[2] * d[3])
+                        results.append((t, int(x + fw // 2), int(y + fh // 2)))
+            frame_idx += 1
+    finally:
+        cap.release()
+        if _MEDIAPIPE_AVAILABLE:
+            detector.close()
+
+    return results
+
+
+def build_clip_crop_filter(
+    video_path: str,
+    source_w: int,
+    source_h: int,
+    focus_zone: str = "center",
+) -> str:
+    """
+    Build a 9:16 crop+scale filter with smooth horizontal face tracking.
+
+    - Samples every 30 frames of the already-trimmed clip
+    - Smooths detected cx positions with a ±2 sample moving average
+    - Builds a piecewise-linear x expression so the crop follows the face
+    - Anchors the face at FACE_Y_TARGET_RATIO (25%) from the top vertically
+    - Falls back to focus_zone-biased crop if no face is detected
+    - Scales the source up before cropping when it is too narrow to fill 9:16
+    """
+    track = _detect_face_track_on_clip(video_path)
+    logger.info("build_clip_crop_filter: %d face sample(s) in %s", len(track), video_path)
+
+    # Crop window in exact 9:16; make both dimensions even (H.264 requirement).
+    crop_h = int(source_h * FACE_CROP_H_RATIO) & ~1
+    crop_w = (crop_h * 9 // 16) & ~1
+
+    # If the source is too narrow to fill crop_w, scale it up first so the crop
+    # always covers exactly crop_w × crop_h pixels with no black borders.
+    if crop_w > source_w:
+        scale_factor = crop_w / source_w
+        scaled_h = int(source_h * scale_factor) & ~1
+        pre_scale = f"scale={crop_w}:{scaled_h}:flags=lanczos,"
+        eff_w, eff_h = crop_w, scaled_h
+        track = [(t, int(cx * scale_factor), int(cy * scale_factor)) for t, cx, cy in track]
+    else:
+        pre_scale = ""
+        eff_w, eff_h = source_w, source_h
+
+    crop_h = min(crop_h, eff_h) & ~1
+
+    def clamp_x(cx: int) -> int:
+        return max(0, min(eff_w - crop_w, cx - crop_w // 2))
+
+    def face_y(cy: int) -> int:
+        y = cy - int(FACE_Y_TARGET_RATIO * crop_h)
+        return max(0, min(eff_h - crop_h, y))
+
+    if not track:
+        if focus_zone == "left":
+            x = 0
+        elif focus_zone == "right":
+            x = max(0, eff_w - crop_w)
+        else:
+            x = max(0, (eff_w - crop_w) // 2)
+        logger.info("build_clip_crop_filter: no face → %s crop x=%d", focus_zone, x)
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+
+    # Stable vertical anchor: average cy across all samples
+    avg_cy = int(sum(t[2] for t in track) / len(track))
+    y = face_y(avg_cy)
+
+    # Smooth horizontal positions with a ±2 sample moving average
+    cx_raw = [t[1] for t in track]
+    window = 2
+    cx_smooth = []
+    for i in range(len(cx_raw)):
+        lo = max(0, i - window)
+        hi = min(len(cx_raw), i + window + 1)
+        cx_smooth.append(int(sum(cx_raw[lo:hi]) / (hi - lo)))
+
+    xs = [clamp_x(cx) for cx in cx_smooth]
+    times = [t[0] for t in track]
+
+    if len(track) == 1:
+        logger.info("build_clip_crop_filter: 1 sample → static crop x=%d y=%d", xs[0], y)
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{xs[0]}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+
+    # Build piecewise-linear FFmpeg expression for x (uses \, to escape commas)
+    # For each interval [t_i, t_{i+1}]: x_i + (x_{i+1}-x_i)*(t-t_i)/(t_{i+1}-t_i)
+    expr = str(xs[-1])  # hold last value beyond final sample
+    for i in range(len(times) - 2, -1, -1):
+        t0, x0 = times[i], xs[i]
+        t1, x1 = times[i + 1], xs[i + 1]
+        dt = t1 - t0
+        if dt <= 0:
+            continue
+        dx = x1 - x0
+        if dx == 0:
+            segment = str(x0)
+        else:
+            segment = f"({x0}+{dx}*(t-{t0:.3f})/{dt:.3f})"
+        expr = f"if(lt(t\\,{t1:.3f})\\,{segment}\\,{expr})"
+
+    logger.info("build_clip_crop_filter: tracking expr len=%d y=%d", len(expr), y)
+    return f"{pre_scale}crop={crop_w}:{crop_h}:{expr}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+
+
+# ---------------------------------------------------------------------------
 # 5. Dynamic crop filter (speaker switching)
 # ---------------------------------------------------------------------------
 
@@ -1049,6 +1221,7 @@ def build_dynamic_crop_filter(
     clip_start: float,
     clip_end: float,
     words: list[Word],
+    focus_zone: str = "center",
 ) -> str:
     """
     Build an FFmpeg crop+scale filter string.
@@ -1063,45 +1236,56 @@ def build_dynamic_crop_filter(
       interval of SPEAKER_SWITCH_MIN_INTERVAL seconds.  Falls back to pause-based
       switching when no speaker labels are present.
     """
-    # --- Crop dimensions (with zoom-in to allow Y adjustment) ---
-    crop_h = int(source_h * FACE_CROP_H_RATIO)
-    crop_w = crop_h * 9 // 16
-    # Clamp to source bounds (handles portrait or square sources)
-    crop_h = min(crop_h, source_h)
-    crop_w = min(crop_w, source_w)
+    # --- Crop dimensions: exact 9:16, even pixel count ---
+    crop_h = int(source_h * FACE_CROP_H_RATIO) & ~1
+    crop_w = (crop_h * 9 // 16) & ~1
+
+    # Scale source up if it is too narrow to fill the 9:16 crop window.
+    if crop_w > source_w:
+        scale_factor = crop_w / source_w
+        scaled_h = int(source_h * scale_factor) & ~1
+        pre_scale = f"scale={crop_w}:{scaled_h}:flags=lanczos,"
+        eff_w, eff_h = crop_w, scaled_h
+        speaker_positions = [
+            (int(cx * scale_factor), int(cy * scale_factor))
+            for cx, cy in speaker_positions
+        ]
+    else:
+        pre_scale = ""
+        eff_w, eff_h = source_w, source_h
+
+    crop_h = min(crop_h, eff_h) & ~1
 
     def clamp_x(cx: int) -> int:
-        return max(0, min(source_w - crop_w, cx - crop_w // 2))
+        return max(0, min(eff_w - crop_w, cx - crop_w // 2))
 
     def face_crop_y(cy: int) -> int:
-        """Shift crop_y so the face appears at FACE_Y_TARGET_RATIO from top."""
         y = cy - int(FACE_Y_TARGET_RATIO * crop_h)
-        return max(0, min(source_h - crop_h, y))
+        return max(0, min(eff_h - crop_h, y))
 
-    # --- No faces: crop top 75 % of frame, centred horizontally ---
-    # Assumes faces (when not detected) are in the upper portion of the shot.
+    # --- No faces: use focus_zone to position crop horizontally ---
     if not speaker_positions:
-        nf_h = int(source_h * 0.75)
-        nf_w = nf_h * 9 // 16
-        nf_w = min(nf_w, source_w)
-        nf_x = max(0, (source_w - nf_w) // 2)
-        return f"crop={nf_w}:{nf_h}:{nf_x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+        if focus_zone == "left":
+            nf_x = 0
+        elif focus_zone == "right":
+            nf_x = max(0, eff_w - crop_w)
+        else:
+            nf_x = max(0, (eff_w - crop_w) // 2)
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{nf_x}:0,scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
     # --- One speaker: static crop centred on face ---
     if len(speaker_positions) == 1:
         cx, cy = speaker_positions[0]
         x = clamp_x(cx)
         y = face_crop_y(cy)
-        return f"crop={crop_w}:{crop_h}:{x}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{x}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
     # --- Two speakers ---
     (cx0, cy0), (cx1, cy1) = speaker_positions[0], speaker_positions[1]
     x0, x1 = clamp_x(cx0), clamp_x(cx1)
-    # Use averaged cy for stable vertical framing — no vertical jump on speaker switch
     avg_cy = (cy0 + cy1) // 2
     y = face_crop_y(avg_cy)
 
-    # Prefer speaker-turn times from diarization; fall back to pause detection
     switch_times = _speaker_turn_times(words, clip_start, clip_end)
     if switch_times:
         logger.info(
@@ -1110,7 +1294,6 @@ def build_dynamic_crop_filter(
             len(switch_times), clip_start, clip_end, x0, x1, y,
         )
     else:
-        # Fallback: switch at speech pauses (old behaviour)
         clip_words = [w for w in words if clip_start <= w.start <= clip_end]
         last_switch_t = -SPEAKER_SWITCH_MIN_INTERVAL
         for i in range(len(clip_words) - 1):
@@ -1127,16 +1310,14 @@ def build_dynamic_crop_filter(
         )
 
     if not switch_times:
-        return f"crop={crop_w}:{crop_h}:{x0}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+        return f"{pre_scale}crop={crop_w}:{crop_h}:{x0}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
-    # Build a nested FFmpeg if(lt(t,T),X,…) expression that toggles x0/x1 at each switch.
-    # Commas inside if() must be escaped as \, for FFmpeg's filter parser.
     xs = [x0, x1]
     expr = str(xs[len(switch_times) % 2])
     for i, t in reversed(list(enumerate(switch_times))):
         expr = f"if(lt(t\\,{t:.3f})\\,{xs[i % 2]}\\,{expr})"
 
-    return f"crop={crop_w}:{crop_h}:{expr}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
+    return f"{pre_scale}crop={crop_w}:{crop_h}:{expr}:{y},scale={FRAME_W}:{FRAME_H}:flags=lanczos"
 
 
 # ---------------------------------------------------------------------------
@@ -1267,17 +1448,21 @@ def build_title_card_filter_keo(title: str, duration: float) -> list[str]:
     return filters
 
 
-def build_title_card_filter_tovaritch(title: str, duration: float) -> list[str]:
+def build_title_card_filter_tovaritch(hook_text: str, duration: float) -> list[str]:
     """
-    Tovaritch style title card: ALL CAPS Impact, first line red #FF2200,
-    second line white, no box/pill, floating on video.
+    Tovaritch title card: hook text in Impact ALL CAPS, size 80, red (0xFF2200).
+    Centered horizontally at 38% from top. No box, no pill, no outline.
+    First line red, second line white if text wraps.
     """
     display_duration = min(3.0, duration)
-    lines, fontsize = _wrap_title(title.upper(), MAX_TITLE_W, 76)
-    line_height = int(fontsize * 1.4)
-    card_top_y = int(FRAME_H * 0.35)
+    text = (hook_text or "").upper().strip()
+    if not text:
+        return []
+    lines, fontsize = _wrap_title(text, MAX_TITLE_W, 80)
+    line_height = int(fontsize * 1.35)
+    card_top_y = int(FRAME_H * 0.38)
 
-    colors = ["#FF2200", "white"]
+    colors = ["0xFF2200", "0xFFFFFF"]
     filters: list[str] = []
     for i, line in enumerate(lines):
         y = card_top_y + i * line_height
@@ -1289,6 +1474,8 @@ def build_title_card_filter_tovaritch(title: str, duration: float) -> list[str]:
             f":text='{_escape_drawtext(line)}'"
             f":x=(w-text_w)/2"
             f":y={y}"
+            f":box=0"
+            f":borderw=0"
             f":enable='between(t\\,0\\,{display_duration:.3f})'"
         )
     return filters
@@ -1415,21 +1602,22 @@ def build_subtitle_filters_keo(cards: list[SubtitleCard]) -> list[str]:
 
 def build_subtitle_filters_tovaritch(cards: list[SubtitleCard]) -> list[str]:
     """
-    Tovaritch style subtitles: ALL CAPS Impact size 76, no box/outline,
-    alternating red (#FF2200) / white per card, centered at 40% from top.
+    Tovaritch style subtitles: ALL CAPS Impact size 76.
+    Alternating red (0xFF2200) / white per card; questions always red.
+    Positioned at 42% from top. NO box, NO outline, NO border.
     """
     if not cards:
         return []
 
-    sub_y = int(FRAME_H * SUB_Y_TOVARITCH)
+    sub_y = int(FRAME_H * 0.42)
     filters: list[str] = []
 
     for idx, card in enumerate(cards):
         t_start = f"{card.display_start:.3f}"
         t_end = f"{card.display_end:.3f}"
-        # Questions always red; otherwise alternate red/white
         is_question = card.text.strip().endswith("?")
-        color = "#FF2200" if (idx % 2 == 0 or is_question) else "white"
+        # Use hex literals so FFmpeg never misinterprets the colour
+        color = "0xFF2200" if (idx % 2 == 0 or is_question) else "0xFFFFFF"
         text = _escape_drawtext(card.text.upper())
         filters.append(
             f"drawtext=fontfile={FONT_PATH_IMPACT}"
@@ -1438,6 +1626,8 @@ def build_subtitle_filters_tovaritch(cards: list[SubtitleCard]) -> list[str]:
             f":text='{text}'"
             f":x=(w-text_w)/2"
             f":y={sub_y}"
+            f":box=0"
+            f":borderw=0"
             f":enable='between(t\\,{t_start}\\,{t_end})'"
         )
 
@@ -1648,6 +1838,7 @@ async def render_clip(
     detections: list[tuple[int, int]],
     output_dir: str,
     subtitle_style: str = "classic",
+    focus_zone: str = "center",
 ) -> str:
     """
     Render one clip to disk.  Returns the path to the final .mp4 file.
@@ -1663,7 +1854,7 @@ async def render_clip(
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _render_clip_sync, spec, source_video,
                                       source_w, source_h, detections, output_dir,
-                                      subtitle_style)
+                                      subtitle_style, focus_zone)
 
 
 def _render_clip_sync(
@@ -1674,6 +1865,7 @@ def _render_clip_sync(
     detections: list[tuple[int, int]],
     output_dir: str,
     subtitle_style: str = "classic",
+    focus_zone: str = "center",
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     tmp_dir = tempfile.mkdtemp(prefix=f"clip_{spec.clip_id}_")
@@ -1713,11 +1905,10 @@ def _render_clip_sync(
             ], desc=f"trim {spec.clip_id}")
 
         # --- Step B: crop to 9:16 ---
-        # words are in output timeline (t=0 = start of trimmed clip)
-        crop_filter = build_dynamic_crop_filter(
-            detections, source_w, source_h,
-            0.0, duration, spec.words,
-        )
+        # Run face detection on the trimmed clip for accurate per-clip tracking.
+        # This replaces the old full-video averaged detections with a smooth
+        # horizontal follow that anchors the face at 25% from top.
+        crop_filter = build_clip_crop_filter(trimmed, source_w, source_h, focus_zone=focus_zone)
         cropped = os.path.join(tmp_dir, "cropped.mp4")
         _run_ffmpeg([
             "-i", trimmed,
@@ -1759,7 +1950,10 @@ def _render_clip_sync(
                 title_filters = build_title_card_filter_keo(spec.title, actual_duration)
                 subtitle_filters = build_subtitle_filters_keo(spec.subtitle_cards)
             elif subtitle_style == "tovaritch":
-                title_filters = build_title_card_filter_tovaritch(spec.title, actual_duration)
+                # For tovaritch the title card shows the hook (viral sentence),
+                # falling back to spec.title if hook is empty.
+                hook_text = spec.hook or spec.title
+                title_filters = build_title_card_filter_tovaritch(hook_text, actual_duration)
                 subtitle_filters = build_subtitle_filters_tovaritch(spec.subtitle_cards)
             else:  # "classic" and any unknown value
                 title_filters = build_title_card_filter(spec.title, actual_duration)
@@ -1773,14 +1967,19 @@ def _render_clip_sync(
 
             all_drawtext: list[str] = title_filters + subtitle_filters
 
-            _CHUNK = 10
-            chunks = [all_drawtext[i:i + _CHUNK] for i in range(0, len(all_drawtext), _CHUNK)]
-            if not chunks:
-                chunks = [["null"]]
+            # tovaritch/keo: single FFmpeg pass — avoids any multi-pass colour
+            # drift and guarantees exactly one drawtext invocation per filter.
+            if subtitle_style in ("tovaritch", "keo"):
+                chunks = [all_drawtext] if all_drawtext else [["null"]]
+            else:
+                _CHUNK = 10
+                chunks = [all_drawtext[i:i + _CHUNK] for i in range(0, len(all_drawtext), _CHUNK)]
+                if not chunks:
+                    chunks = [["null"]]
             logger.info(
-                "Clip %s — subtitle render: %d drawtext filters → %d pass(es) of ≤%d "
+                "Clip %s — subtitle render: %d drawtext filters → %d pass(es) "
                 "(title card in pass 1 of %d)",
-                spec.clip_id, len(all_drawtext), len(chunks), _CHUNK, len(chunks),
+                spec.clip_id, len(all_drawtext), len(chunks), len(chunks),
             )
             current_input = cropped
             for pass_idx, chunk in enumerate(chunks):
@@ -1829,13 +2028,19 @@ def _render_clip_sync(
             pre_cta = text_burned
 
         # --- Step F: append CTA ---
+        # Only "classic" gets the CTA outro. "tovaritch" and "keo" skip it entirely.
         final = os.path.join(output_dir, f"{spec.clip_id}.mp4")
-        try:
-            append_cta_fast(pre_cta, final)
-        except Exception as exc:
-            logger.warning("CTA append failed (%s), using clip without CTA: %s", spec.clip_id, exc)
+        if subtitle_style not in ("tovaritch", "keo"):
+            try:
+                append_cta_fast(pre_cta, final)
+            except Exception as exc:
+                logger.warning("CTA append failed (%s), using clip without CTA: %s", spec.clip_id, exc)
+                import shutil
+                shutil.copy2(pre_cta, final)
+        else:
             import shutil
             shutil.copy2(pre_cta, final)
+            logger.info("Clip %s — CTA skipped (style=%s)", spec.clip_id, subtitle_style)
 
         # Verify output
         if not os.path.exists(final):
@@ -1861,6 +2066,7 @@ async def process_video_pipeline(
     project_id: str,
     db: AsyncIOMotorDatabase,
     subtitle_style: str = "classic",
+    focus_zone: str = "center",
 ) -> None:
     """
     Full pipeline entry point.  Called by server.py via asyncio.create_task().
@@ -2168,7 +2374,7 @@ async def process_video_pipeline(
                 try:
                     local_path = await render_clip(
                         spec, source_video_path, source_w, source_h,
-                        detections, output_dir, subtitle_style,
+                        detections, output_dir, subtitle_style, focus_zone,
                     )
 
                     # Verify before upload
@@ -2322,6 +2528,7 @@ async def render_manual_pipeline(
     manual_clips: list[dict],
     db: AsyncIOMotorDatabase,
     subtitle_style: str = "classic",
+    focus_zone: str = "center",
 ) -> None:
     """Render clips with manually specified boundaries.
 
@@ -2459,7 +2666,7 @@ async def render_manual_pipeline(
                 try:
                     local_path = await render_clip(
                         spec, source_video_path, source_w, source_h,
-                        detections, output_dir, subtitle_style,
+                        detections, output_dir, subtitle_style, focus_zone,
                     )
                     if not os.path.exists(local_path):
                         raise FileNotFoundError(f"Rendered file missing: {local_path}")
