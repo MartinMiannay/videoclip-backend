@@ -154,6 +154,24 @@ class ChunkUploadInit(BaseModel):
     file_size: int = 0
 
 
+class ProcessRequest(BaseModel):
+    subtitle_style: str = "classic"
+    focus_zone: str = "center"   # "left" | "center" | "right"
+
+
+class ManualClip(BaseModel):
+    start_seconds: float
+    end_seconds: float
+    title: str
+    hook_note: str = ""
+
+
+class ManualRenderRequest(BaseModel):
+    clips: List[ManualClip]
+    subtitle_style: str = "classic"
+    focus_zone: str = "center"   # "left" | "center" | "right"
+
+
 # --- API Endpoints ---
 
 @api_router.get("/")
@@ -368,24 +386,6 @@ async def stream_project_video(project_id: str):
     if not video_path or not os.path.isfile(video_path):
         raise HTTPException(404, "Video file not found")
     return FileResponse(video_path, media_type="video/mp4")
-
-
-class ProcessRequest(BaseModel):
-    subtitle_style: str = "classic"
-    focus_zone: str = "center"   # "left" | "center" | "right"
-
-
-class ManualClip(BaseModel):
-    start_seconds: float
-    end_seconds: float
-    title: str
-    hook_note: str = ""
-
-
-class ManualRenderRequest(BaseModel):
-    clips: List[ManualClip]
-    subtitle_style: str = "classic"
-    focus_zone: str = "center"   # "left" | "center" | "right"
 
 
 @api_router.post("/projects/{project_id}/render-manual")
