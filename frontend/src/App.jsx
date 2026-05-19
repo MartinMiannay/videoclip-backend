@@ -272,9 +272,17 @@ const SUBTITLE_STYLES = [
   { value: 'tovaritch', label: 'Tovaritch', desc: 'Impact ALL CAPS, red & white, no music' },
 ]
 
+const CROP_ZONES = [
+  { value: 'auto',   label: 'Auto',   desc: 'Face tracking' },
+  { value: 'left',   label: 'Gauche', desc: 'Left third' },
+  { value: 'center', label: 'Centre', desc: 'Center' },
+  { value: 'right',  label: 'Droite', desc: 'Right third' },
+]
+
 function ProjectPanel({ project: initial, onDeleted, onUpdated }) {
   const [project, setProject] = useState(initial)
   const [subtitleStyle, setSubtitleStyle] = useState('classic')
+  const [cropZone, setCropZone] = useState('auto')
   const intervalRef = useRef()
 
   const poll = useCallback(async () => {
@@ -305,7 +313,7 @@ function ProjectPanel({ project: initial, onDeleted, onUpdated }) {
     await fetch(`${API}/api/projects/${project.id}/process`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ subtitle_style: subtitleStyle }),
+      body: JSON.stringify({ subtitle_style: subtitleStyle, crop_zone: cropZone }),
     })
     setProject(p => ({ ...p, status: 'processing', processing_step: 'starting', processing_progress: 0 }))
   }
@@ -366,7 +374,7 @@ function ProjectPanel({ project: initial, onDeleted, onUpdated }) {
       {project.status === 'uploaded' && (
         <div style={{ marginTop: 20 }}>
           {/* Style selector */}
-          <div style={{ marginBottom: 18 }}>
+          <div style={{ marginBottom: 14 }}>
             <div style={{ fontSize: 11, fontWeight: 600, color: '#555', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>
               Subtitle Style
             </div>
@@ -389,6 +397,35 @@ function ProjectPanel({ project: initial, onDeleted, onUpdated }) {
                 >
                   <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 2 }}>{st.label}</div>
                   <div style={{ fontSize: 11, opacity: 0.7 }}>{st.desc}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Cadrage selector */}
+          <div style={{ marginBottom: 18 }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: '#555', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>
+              Cadrage
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              {CROP_ZONES.map(cz => (
+                <button
+                  key={cz.value}
+                  onClick={() => setCropZone(cz.value)}
+                  style={{
+                    flex: 1,
+                    padding: '8px 10px',
+                    borderRadius: 7,
+                    border: `1px solid ${cropZone === cz.value ? '#6c8fff' : '#2a2a2a'}`,
+                    background: cropZone === cz.value ? '#1a1f2e' : '#161616',
+                    color: cropZone === cz.value ? '#c5d0ff' : '#777',
+                    cursor: 'pointer',
+                    textAlign: 'left',
+                    transition: 'all .15s',
+                  }}
+                >
+                  <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 2 }}>{cz.label}</div>
+                  <div style={{ fontSize: 11, opacity: 0.7 }}>{cz.desc}</div>
                 </button>
               ))}
             </div>
