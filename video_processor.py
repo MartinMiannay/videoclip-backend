@@ -345,6 +345,60 @@ REJETTE absolument si :
 ❌ Hook faible ou long (> 8 mots avant la première info choc)
 ❌ Longueur dans la zone morte (30-60 secondes / 40-130 mots)
 ❌ Pas de chiffre, pas d'histoire, pas de débat, pas d'émotion
+"""
+
+BOUNDARY_PROMPT = """\
+You are a precision video editor for French short-form business content.
+
+You will receive transcript excerpts for ALL themes from an interview. \
+Select the best 12–14 clips total — one per theme, choosing the themes with \
+the strongest viral potential. You MUST return at least 12 clips, never fewer \
+than 10. Every selected theme MUST have a clip; do not skip a theme you have chosen.
+
+HOOK SELECTION — for each theme, scan ALL sentences in the transcript excerpt \
+and find the single most shocking, controversial or emotionally charged sentence. \
+That sentence must be the hook start.
+
+STRONG hooks contain: a specific number, a personal confession, a contradiction, \
+a direct challenge, or a surprising consequence.
+
+WEAK hooks are: context-setting, topic introductions, questions without tension, \
+transitions.
+
+If the strongest line is mid-excerpt, start there even if it cuts off context. \
+The viewer can figure it out.
+
+START RULES — the clip must open on:
+- A surprising stat, bold claim, provocative question, or mid-tension moment
+- The exact word where the tension or insight begins
+- Start mid-conflict or mid-revelation, NEVER on context-setting
+- Prefer clips where the first sentence creates immediate dissonance or tension
+- The hook must make the viewer think "wait, what?" in the first 3 seconds
+- NEVER start on "donc", "voilà", "en fait", "bah", "alors", "bonjour", \
+  "aujourd'hui je vais", or any other filler or scene-setting phrase
+
+END RULES — cut immediately after:
+- The key insight or punchline lands
+- Before the speaker pivots to explanation, context, or a new point
+
+DURATION: Aim for 30–90 seconds. If the best moment for a theme is slightly \
+outside that range, include it anyway — always return the best clip for each \
+selected theme even if imperfect.
+
+VIRAL HOOK EXAMPLES (real high-performing French business clips):
+- "Tu n'es pas intelligent si c'est toi qui crée la valeur" — contrarian reframe \
+  of entrepreneurship
+- "Tu penses que tu es libre, mais tu es 100% esclave" — shocking reframe
+- "1000€ de bénéfice valent en réalité 5000 ou 7000€" — shocking stat
+- "Je dormais dans mes bureaux, mes employés se lavaient dans ma douche" — \
+  personal sacrifice story
+- "T'as 20 ans, y'a pas besoin de partir en vacances" — direct challenge
+- "Je ne pouvais pas survivre avec un loyer de 15 000€" — dramatic consequence
+- "Tu vas savoir si tu es un entrepreneur ou pas" — direct challenge/tension
+- "Embaucher ma femme c'est une bonne idée ?"
+- "Un téléphone pro ? Seulement quand on gagne 1 000 000 €"
+- "Pourquoi faire du black vous appauvrit ?"
+- "Il fait 500 000€/an et voyage pendant 5 mois !"
 
 OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 {
@@ -353,7 +407,7 @@ OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
       "theme": "<exact theme label as provided>",
       "start": <float seconds>,
       "end": <float seconds>,
-      "title": "<French hook title, min 11 words>",
+      "title": "<French hook title, max 60 chars>",
       "hook": "<one sentence explaining why this clip stops a scroll>",
       "virality_score": <integer 1–10, how likely this clip goes viral on TikTok/Reels>
     }
@@ -780,7 +834,7 @@ def find_clip_boundaries_with_claude(
         )
     user_msg = "\n\n---\n\n".join(parts)
 
-    data = _claude_json(CLIP_SYSTEM_PROMPT, user_msg, "boundaries", sleep_seconds=30, max_tokens=8192)
+    data = _claude_json(CLIP_SYSTEM_PROMPT + "\n\n" + BOUNDARY_PROMPT, user_msg, "boundaries", sleep_seconds=30, max_tokens=8192)
     all_raw_clips = data.get("clips", [])
 
     # Enforce one clip per theme at the code level
