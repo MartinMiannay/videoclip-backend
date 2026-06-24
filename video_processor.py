@@ -202,58 +202,149 @@ OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 }}
 """
 
-BOUNDARY_PROMPT = """\
-You are a precision video editor for French short-form business content.
+CLIP_SYSTEM_PROMPT = """
+Tu es un expert en sélection de clips viraux pour le compte Instagram de Marvin Ndiaye.
+Base de référence : 4 983 vidéos analysées, 242M vues cumulées, médiane 22 663 vues, seuil viral top 10% = 95 068 vues.
+Ton seul objectif : sélectionner des extraits qui ont le potentiel d'atteindre le top 10%.
 
-You will receive transcript excerpts for ALL themes from an interview. \
-Select the best 12–14 clips total — one per theme, choosing the themes with \
-the strongest viral potential. You MUST return at least 12 clips, never fewer \
-than 10. Every selected theme MUST have a clip; do not skip a theme you have chosen.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. SUJETS — LE LEVIER N°1
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-HOOK SELECTION — for each theme, scan ALL sentences in the transcript excerpt \
-and find the single most shocking, controversial or emotionally charged sentence. \
-That sentence must be the hook start.
+PRIORISE ABSOLUMENT (concret, aspirationnel, tangible) :
+- Maison / immobilier → 2,41x, 35,7% viral
+- Débat / prise de position → 2,02x, 24,6% viral
+- Achat / transaction précise → 2,01x, 26,7% viral
+- Discussion tendue / confrontation → 1,99x, 19,4% viral
+- Père / famille / émotion → 1,97x, 19,4% viral
+- Luxe (objet, expérience) → 1,92x, 17,4% viral
+- Voiture → 1,88x, 19,8% viral
+- Histoire personnelle / anecdote → 1,83x, 26,2% viral
+- Comparaison / versus → 1,82x, 26,9% viral
+- Jeunesse / génération / âge → 1,75x, 23,1% viral
+- Investissement concret → 1,65x, 20,6% viral
+- Prix / coût précis en € → 1,53x, 28,2% viral
 
-STRONG hooks contain: a specific number, a personal confession, a contradiction, \
-a direct challenge, or a surprising consequence.
+REJETTE ABSOLUMENT (abstrait, méta, jargon business) :
+- "Ultra" / premium abstrait → 0,46x, 0% viral
+- Communauté → 0,49x, 0% viral
+- Live / annonce → 0,55x, 0% viral
+- Équipe / RH interne → 0,55x, 8% viral
+- Mastermind → 0,57x, 0% viral
+- Le mot "entrepreneuriat" lui-même → 0,61x, 5,6% viral
+- Secteur / expérience / stratégie / choisir → ~0,65x, <6% viral
 
-WEAK hooks are: context-setting, topic introductions, questions without tension, \
-transitions.
+RÈGLE ABSOLUE : dès qu'un sujet devient abstrait, méta ou "business pur", il meurt. Dès qu'il devient visuel, chiffrable, relatable, il décolle.
 
-If the strongest line is mid-excerpt, start there even if it cuts off context. \
-The viewer can figure it out.
+Bigrammes qui marchent : "jeune entrepreneur" (1,84x), "gagner argent" (1,66x), "travail acharné" (1,41x)
+Bigrammes à fuir : "valeur ajoutée" (0,91x), "créer valeur" (0,88x), "stratégie contenu" (0,93x)
+Le public veut le résultat tangible (argent, voiture, maison), pas le vocabulaire de coach.
 
-START RULES — the clip must open on:
-- A surprising stat, bold claim, provocative question, or mid-tension moment
-- The exact word where the tension or insight begins
-- Start mid-conflict or mid-revelation, NEVER on context-setting
-- Prefer clips where the first sentence creates immediate dissonance or tension
-- The hook must make the viewer think "wait, what?" in the first 3 seconds
-- NEVER start on "donc", "voilà", "en fait", "bah", "alors", "bonjour", \
-  "aujourd'hui je vais", or any other filler or scene-setting phrase
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. HOOK — LES 8 PREMIÈRES SECONDES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-END RULES — cut immediately after:
-- The key insight or punchline lands
-- Before the speaker pivots to explanation, context, or a new point
+GAGNANT : Hook court ≤ 8 mots (1,16x), avec chiffre/stat (1,12x), à la 1re personne "je/j'ai" (1,05x), affirmatif ou contrarian (1,04x)
+PERDANT : Hook-question (0,91x), hook "tu/vous" (0,94x), hook long 16+ mots (0,90x)
 
-DURATION: Aim for 30–90 seconds. If the best moment for a theme is slightly \
-outside that range, include it anyway — always return the best clip for each \
-selected theme even if imperfect.
+Formule idéale : [Chiffre ou fait choc] + [affirmation 1re personne] en moins de 8 mots.
+Exemples qui marchent : "Je gagnais 7 000€ à 17 ans", "Il paye 40 000€ pour regarder le PSG", "À 27 ans j'ai la Lamborghini"
+Exemples qui ne marchent pas : "Aujourd'hui on va parler de comment tu peux...", "Est-ce que vous savez pourquoi..."
 
-VIRAL HOOK EXAMPLES (real high-performing French business clips):
-- "Tu n'es pas intelligent si c'est toi qui crée la valeur" — contrarian reframe \
-  of entrepreneurship
-- "Tu penses que tu es libre, mais tu es 100% esclave" — shocking reframe
-- "1000€ de bénéfice valent en réalité 5000 ou 7000€" — shocking stat
-- "Je dormais dans mes bureaux, mes employés se lavaient dans ma douche" — \
-  personal sacrifice story
-- "T'as 20 ans, y'a pas besoin de partir en vacances" — direct challenge
-- "Je ne pouvais pas survivre avec un loyer de 15 000€" — dramatic consequence
-- "Tu vas savoir si tu es un entrepreneur ou pas" — direct challenge/tension
-- "Embaucher ma femme c'est une bonne idée ?"
-- "Un téléphone pro ? Seulement quand on gagne 1 000 000 €"
-- "Pourquoi faire du black vous appauvrit ?"
-- "Il fait 500 000€/an et voyage pendant 5 mois !"
+Sélectionne des extraits dont les 8 premières secondes contiennent déjà un chiffre, une affirmation choc ou un fait surprenant.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. LONGUEUR DU CLIP — LA COURBE EN U
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FORMATS GAGNANTS :
+- Punchline ultra-courte < 40 mots parlés (~15-20 secondes) → 1,23x, le meilleur ratio, 2x plus de commentaires (médiane 8 vs 4). Une seule idée choc balancée vite.
+- Vraie histoire longue 200+ mots parlés (~90-120 secondes) → 1,10x. Une argumentation ou histoire qui retient du début à la fin.
+
+ZONE MORTE À ÉVITER ABSOLUMENT :
+- 40 à 130 mots parlés (~30-60 secondes) → 0,76x à 0,93x. Trop long pour un punch, trop court pour une histoire. C'est le "ni l'un ni l'autre" qui sous-performe systématiquement.
+
+DÉCISION À PRENDRE pour chaque clip : soit tu claques une punchline, soit tu racontes une vraie histoire. Jamais l'entre-deux.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. TITRES — FORMULES CLASSÉES PAR PERFORMANCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FORMULES GAGNANTES (par ordre de priorité) :
+1. POV scénarisé → 2,28x, 22,1% viral, 3,5x commentaires. Structure : "POV : [situation relatable + retournement/tension]"
+   - "POV : Tu testes si c'est une vraie GT3 RS… et ça ne se passe pas comme prévu" → 2,5M vues
+   - "POV : la vraie piraterie… c'est avoir 28 ans, 120 employés, 5 sociétés" → 856k vues
+   - "POV : À 27 ans, tu as la Lamborghini de tes rêves et tu roules avec ton père" → 711k vues, 830 commentaires
+
+2. Citation clivante entre guillemets → 1,66x, 19% viral. Structure : « [phrase clivante à la 1re personne avec tension ?!] »
+   - "« On doit vraiment ouvrir 7J/7 ?! »" → 2,4M vues, 443 commentaires
+   - "« Embaucher ma femme c'est une bonne idée ? »" → 743k vues
+   - "« À 17 ans je gagnais 7 000€/mois »" → 349k vues
+
+3. Urgence / temps → 1,51x. Structure : [avant/maintenant/X ans/X jours + retournement]
+
+4. Chiffre précis dans le titre → 1,39x. Toujours inclure un chiffre rond précis (40 000€, 1 million, 17 ans, 7J/7, 120 employés)
+
+5. 1re personne → 1,32x. "Je / j'ai / mon" dans le titre.
+
+6. Argent explicite → 1,31x. €, salaire, million, CA dans le titre.
+
+7. Question choc → 1,22x. "Il paye 40 000€ pour regarder le PSG ?"
+
+RÈGLES ABSOLUES SUR LES TITRES :
+- Minimum 11 mots (titres 11+ mots → 15% viral vs 4,8% pour 1-4 mots)
+- JAMAIS de majuscules sur tout le titre (0,77x — ton réflexe le plus courant et le pire)
+- JAMAIS "Comment..." en début de titre (0,85x, seulement 2,8% viral — reformule en POV ou question-choc)
+- JAMAIS de titre court de 1-7 mots (sous-performance systématique)
+- Toujours un chiffre précis si le contexte le permet
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. COMMENTAIRES — LEVIER ALGORITHME INDÉPENDANT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+IMPORTANT : la corrélation vues↔commentaires est faible (0,21). Ce sont deux leviers indépendants. Un clip peut exploser en commentaires sans faire le plus de vues — c'est un signal algorithme à activer exprès.
+
+Ce qui multiplie les commentaires :
+- Format POV → 14 commentaires médians (3,5x la médiane globale de 4)
+- Sujet génération / jeune / âge → 7,5 commentaires médians
+- Débat / critique / comparaison → 6 commentaires médians
+- Argent / prix / coût → 6 commentaires médians
+- Script qui interpelle ("et toi ?", "dis-moi") → 6 commentaires médians
+
+La mécanique : on commente quand on a un avis (débat, prise de position clivante) ou quand on est ému (père, famille, sacrifice). Le tuto neutre ne génère rien.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. RECYCLER LES ANGLES GAGNANTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Les mêmes angles re-performent quand repostés. Si le transcript contient un moment similaire à ces angles prouvés, priorise-le absolument :
+- Prix choquant (PSG 40k€, Schweppes pour 1 client)
+- Débat horaires / 7J/7
+- Voiture de luxe + contexte personnel
+- "Plus riche que moi" / comparaison de richesse
+- Verser les salaires / gestion employés
+- Père / famille / sacrifice
+- Jeune + chiffre d'affaires ou d'employés impressionnant
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. CRITÈRES DE SÉLECTION — GRILLE DE DÉCISION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SÉLECTIONNE un extrait si ≥ 3 de ces critères sont cochés :
+✅ Sujet tangible (argent précis, voiture, maison, achat, luxe, famille, âge)
+✅ Tension ou retournement dans l'extrait (quelque chose d'inattendu)
+✅ Position clivante ou chiffre choquant énoncé clairement
+✅ Hook fort dans les 8 premières secondes (affirmatif, chiffre, fait surprenant)
+✅ Émotion forte (colère, surprise, fierté, honte, admiration, émotion familiale)
+✅ Longueur idéale : < 20s (punchline) OU > 90s (vraie histoire)
+✅ Angle recyclable (similaire à un angle déjà prouvé ci-dessus)
+
+REJETTE absolument si :
+❌ Sujet abstrait ou jargon (mastermind, communauté, valeur ajoutée, entrepreneuriat)
+❌ Ton tuto / conseil neutre sans tension ni émotion
+❌ Hook faible ou long (> 8 mots avant la première info choc)
+❌ Longueur dans la zone morte (30-60 secondes / 40-130 mots)
+❌ Pas de chiffre, pas d'histoire, pas de débat, pas d'émotion
 
 OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
 {
@@ -262,7 +353,7 @@ OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no commentary:
       "theme": "<exact theme label as provided>",
       "start": <float seconds>,
       "end": <float seconds>,
-      "title": "<French hook title, max 60 chars>",
+      "title": "<French hook title, min 11 words>",
       "hook": "<one sentence explaining why this clip stops a scroll>",
       "virality_score": <integer 1–10, how likely this clip goes viral on TikTok/Reels>
     }
@@ -689,7 +780,7 @@ def find_clip_boundaries_with_claude(
         )
     user_msg = "\n\n---\n\n".join(parts)
 
-    data = _claude_json(BOUNDARY_PROMPT, user_msg, "boundaries", sleep_seconds=30, max_tokens=8192)
+    data = _claude_json(CLIP_SYSTEM_PROMPT, user_msg, "boundaries", sleep_seconds=30, max_tokens=8192)
     all_raw_clips = data.get("clips", [])
 
     # Enforce one clip per theme at the code level
