@@ -2595,12 +2595,66 @@ async def transcribe_only_pipeline(project_id: str, db: AsyncIOMotorDatabase) ->
         await set_progress("error", 0, str(exc)[:300], status="error")
 
 
+def _make_slug(text: str) -> str:
+    return re.sub(r"[^\w]+", "_", text.lower()).strip("_")[:40]
+
+
+def _render_derush_clip_sync(
+    spec: "ClipSpec",
+    source_video: str,
+    output_dir: str,
+    idx: int,
+) -> tuple[str, str]:
+    """Trim the source clip and burn a small title label in the top-left corner.
+
+    No crop, no subtitles, no music, no CTA — original 16:9 frame + audio.
+    Returns (local_output_path, derush_download_filename).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"{spec.clip_id}.mp4")
+    slug = _make_slug(spec.title or spec.hook or spec.clip_id)
+    download_name = f"derush_{idx}_{slug}.mp4"
+    label = _escape_drawtext((spec.title or spec.hook or "")[:80])
+    vf = (
+        f"drawtext=fontfile={FONT_PATH}"
+        f":text='{label}'"
+        f":fontsize=24"
+        f":fontcolor=white"
+        f":shadowcolor=black@0.7"
+        f":shadowx=1:shadowy=1"
+        f":x=20:y=20"
+    )
+    _run_ffmpeg([
+        "-ss", str(spec.start),
+        "-to", str(spec.end),
+        "-i", source_video,
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k",
+        "-y", out_path,
+    ], desc=f"derush {spec.clip_id}")
+    return out_path, download_name
+
+
+async def render_derush_clip(
+    spec: "ClipSpec",
+    source_video: str,
+    output_dir: str,
+    idx: int,
+) -> tuple[str, str]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, _render_derush_clip_sync, spec, source_video, output_dir, idx
+    )
+
+
 async def render_manual_pipeline(
     project_id: str,
     manual_clips: list[dict],
     db: AsyncIOMotorDatabase,
     subtitle_style: str = "classic",
     crop_zone: str = "auto",
+    derush: bool = False,
 ) -> None:
     """Render clips with manually specified boundaries.
 
@@ -2656,7 +2710,6 @@ async def render_manual_pipeline(
             for w in stored_words
         ]
 
-        # Build raw clip list from manual input, then apply silence trimming
         raw_clips = [
             {
                 "start": float(c["start_seconds"]),
@@ -2666,10 +2719,11 @@ async def render_manual_pipeline(
             }
             for c in manual_clips
         ]
-        raw_clips = trim_clip_silences(raw_clips, words)
-        if not raw_clips:
-            await set_progress("error", 0, "All clips were too short after silence trimming.", status="error")
-            return
+        if not derush:
+            raw_clips = trim_clip_silences(raw_clips, words)
+            if not raw_clips:
+                await set_progress("error", 0, "All clips were too short after silence trimming.", status="error")
+                return
 
         # Build ClipSpec objects and initial DB docs
         clip_specs_map: dict[str, ClipSpec] = {}
@@ -2715,18 +2769,20 @@ async def render_manual_pipeline(
 
         await projects.update_one({"id": project_id}, {"$set": {"short_clips": clip_docs}})
 
-        # Dimensions + optional face detection (auto mode only)
-        await set_progress("detecting_speakers", 10, "Détection des visages…")
-        source_w, source_h = await asyncio.get_event_loop().run_in_executor(
-            None, get_video_dimensions, source_video_path
-        )
-        if crop_zone == "auto":
-            detections = await asyncio.get_event_loop().run_in_executor(
-                None, detect_speakers, source_video_path
+        # Dimensions + optional face detection (skipped in derush mode)
+        source_w, source_h = 0, 0
+        detections: list = []
+        if not derush:
+            await set_progress("detecting_speakers", 10, "Détection des visages…")
+            source_w, source_h = await asyncio.get_event_loop().run_in_executor(
+                None, get_video_dimensions, source_video_path
             )
-        else:
-            detections = []
-            logger.info("Skipping full-video face detection (crop_zone=%s)", crop_zone)
+            if crop_zone == "auto":
+                detections = await asyncio.get_event_loop().run_in_executor(
+                    None, detect_speakers, source_video_path
+                )
+            else:
+                logger.info("Skipping full-video face detection (crop_zone=%s)", crop_zone)
 
         # Render all clips in parallel
         await set_progress("rendering", 20, f"Rendu de {len(clip_specs_map)} clips…")
@@ -2740,10 +2796,16 @@ async def render_manual_pipeline(
             async with semaphore:
                 await update_clip(spec.clip_id, status="rendering", error="")
                 try:
-                    local_path = await render_clip(
-                        spec, source_video_path, source_w, source_h,
-                        detections, output_dir, subtitle_style, crop_zone,
-                    )
+                    download_filename: str | None = None
+                    if derush:
+                        local_path, download_filename = await render_derush_clip(
+                            spec, source_video_path, output_dir, idx
+                        )
+                    else:
+                        local_path = await render_clip(
+                            spec, source_video_path, source_w, source_h,
+                            detections, output_dir, subtitle_style, crop_zone,
+                        )
                     if not os.path.exists(local_path):
                         raise FileNotFoundError(f"Rendered file missing: {local_path}")
                     if os.path.getsize(local_path) < 100_000:
@@ -2756,7 +2818,10 @@ async def render_manual_pipeline(
                     )
                     done_count += 1
                     progress = 20 + int(done_count / total * 75)
-                    await update_clip(spec.clip_id, status="done", storage_path=storage_path)
+                    clip_update: dict = {"status": "done", "storage_path": storage_path}
+                    if download_filename:
+                        clip_update["download_filename"] = download_filename
+                    await update_clip(spec.clip_id, **clip_update)
                     await set_progress("rendering", progress, f"{done_count}/{total} clips prêts")
                     logger.info("Manual clip %d/%d done: %s", idx + 1, total, spec.clip_id)
                 except Exception as exc:

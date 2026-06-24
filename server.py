@@ -170,6 +170,7 @@ class ManualRenderRequest(BaseModel):
     clips: List[ManualClip]
     subtitle_style: str = "classic"
     crop_zone: str = "auto"   # "auto" | "left" | "center" | "right"
+    derush: bool = False
 
 
 # --- API Endpoints ---
@@ -412,6 +413,7 @@ async def render_manual_clips(project_id: str, data: ManualRenderRequest):
         project_id, [c.model_dump() for c in data.clips], db,
         subtitle_style=data.subtitle_style,
         crop_zone=data.crop_zone,
+        derush=data.derush,
     ))
 
     result = await db.projects.find_one({"id": project_id}, {"_id": 0, "transcript_words": 0})
@@ -481,8 +483,11 @@ async def download_clip(project_id: str, clip_id: str):
         raise HTTPException(404, "Clip file not found on disk")
 
     import re
-    safe_caption = re.sub(r'[^\w\s-]', '', clip.get('caption', 'untitled')[:30]).strip().replace(' ', '_')
-    filename = f"clip_{safe_caption or 'untitled'}.mp4"
+    if clip.get("download_filename"):
+        filename = clip["download_filename"]
+    else:
+        safe_caption = re.sub(r'[^\w\s-]', '', clip.get('caption', 'untitled')[:30]).strip().replace(' ', '_')
+        filename = f"clip_{safe_caption or 'untitled'}.mp4"
     return FileResponse(
         clip_path, media_type="video/mp4",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}

@@ -45,6 +45,7 @@ export default function ManualClipMode({ project, onRenderStarted }) {
   const [rendering, setRendering] = useState(false)
   const [subtitleStyle, setSubtitleStyle] = useState('classic')
   const [cropZone, setCropZone] = useState('auto')
+  const [derushMode, setDerushMode] = useState(false)
 
   const SUBTITLE_STYLES = [
     { value: 'classic',   label: 'Classic' },
@@ -186,6 +187,7 @@ export default function ManualClipMode({ project, onRenderStarted }) {
         body: JSON.stringify({
           subtitle_style: subtitleStyle,
           crop_zone: cropZone,
+          derush: derushMode,
           clips: queuedClips.map(c => ({
             start_seconds: c.start,
             end_seconds:   c.end,
@@ -418,48 +420,86 @@ export default function ManualClipMode({ project, onRenderStarted }) {
 
         {queuedClips.length > 0 && (
           <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid #1e1e1e' }}>
-            {/* Style selector */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-              <span style={{ fontSize: 11, fontWeight: 600, color: '#555', textTransform: 'uppercase', letterSpacing: 1 }}>Style</span>
-              {SUBTITLE_STYLES.map(st => (
-                <button
-                  key={st.value}
-                  onClick={() => setSubtitleStyle(st.value)}
-                  style={{
-                    ...btn(subtitleStyle === st.value ? 'primary' : 'secondary'),
-                    padding: '4px 12px',
-                    fontSize: 12,
-                    border: subtitleStyle === st.value ? '1px solid #6c8fff' : '1px solid #333',
-                  }}
-                >
-                  {st.label}
-                </button>
-              ))}
-            </div>
-            {/* Cadrage selector */}
+            {/* Mode toggle: Rendu / Derush */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-              <span style={{ fontSize: 11, fontWeight: 600, color: '#555', textTransform: 'uppercase', letterSpacing: 1 }}>Cadrage</span>
-              {CROP_ZONES.map(cz => (
-                <button
-                  key={cz.value}
-                  onClick={() => setCropZone(cz.value)}
-                  style={{
-                    ...btn(cropZone === cz.value ? 'primary' : 'secondary'),
-                    padding: '4px 12px',
-                    fontSize: 12,
-                    border: cropZone === cz.value ? '1px solid #6c8fff' : '1px solid #333',
-                  }}
-                >
-                  {cz.label}
-                </button>
-              ))}
+              <span style={{ fontSize: 11, fontWeight: 600, color: '#555', textTransform: 'uppercase', letterSpacing: 1 }}>Mode</span>
+              <button
+                onClick={() => setDerushMode(false)}
+                style={{
+                  ...btn(derushMode ? 'secondary' : 'primary'),
+                  padding: '4px 14px',
+                  fontSize: 12,
+                  border: !derushMode ? '1px solid #6c8fff' : '1px solid #333',
+                }}
+              >
+                Mode Rendu
+              </button>
+              <button
+                onClick={() => setDerushMode(true)}
+                style={{
+                  ...btn(derushMode ? 'primary' : 'secondary'),
+                  padding: '4px 14px',
+                  fontSize: 12,
+                  border: derushMode ? '1px solid #6c8fff' : '1px solid #333',
+                }}
+              >
+                Mode Derush
+              </button>
+              {derushMode && (
+                <span style={{ fontSize: 11, color: '#666', marginLeft: 4 }}>
+                  16:9 · audio original · label titre
+                </span>
+              )}
             </div>
+
+            {/* Style + Cadrage — hidden in derush mode */}
+            {!derushMode && (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: '#555', textTransform: 'uppercase', letterSpacing: 1 }}>Style</span>
+                  {SUBTITLE_STYLES.map(st => (
+                    <button
+                      key={st.value}
+                      onClick={() => setSubtitleStyle(st.value)}
+                      style={{
+                        ...btn(subtitleStyle === st.value ? 'primary' : 'secondary'),
+                        padding: '4px 12px',
+                        fontSize: 12,
+                        border: subtitleStyle === st.value ? '1px solid #6c8fff' : '1px solid #333',
+                      }}
+                    >
+                      {st.label}
+                    </button>
+                  ))}
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: '#555', textTransform: 'uppercase', letterSpacing: 1 }}>Cadrage</span>
+                  {CROP_ZONES.map(cz => (
+                    <button
+                      key={cz.value}
+                      onClick={() => setCropZone(cz.value)}
+                      style={{
+                        ...btn(cropZone === cz.value ? 'primary' : 'secondary'),
+                        padding: '4px 12px',
+                        fontSize: 12,
+                        border: cropZone === cz.value ? '1px solid #6c8fff' : '1px solid #333',
+                      }}
+                    >
+                      {cz.label}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+
             <button
               style={{ ...btn('success'), padding: '10px 24px', fontSize: 14, opacity: rendering ? 0.6 : 1 }}
               onClick={renderAll}
               disabled={rendering}
             >
-              {rendering ? 'Starting render…' : `Render All ${queuedClips.length} Clip${queuedClips.length !== 1 ? 's' : ''}`}
+              {rendering
+                ? 'Starting render…'
+                : `${derushMode ? 'Derush' : 'Render'} All ${queuedClips.length} Clip${queuedClips.length !== 1 ? 's' : ''}`}
             </button>
           </div>
         )}
