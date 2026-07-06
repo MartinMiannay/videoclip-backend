@@ -678,7 +678,7 @@ def _claude_json(system: str, user: str, label: str, sleep_seconds: int = 60, ma
         time.sleep(sleep_seconds)
         logger.info("Claude [%s] sending request — user msg %d chars", label, len(user))
         message = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=max_tokens,
             system=system,
             messages=[{"role": "user", "content": user}],
