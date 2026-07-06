@@ -345,6 +345,41 @@ REJETTE absolument si :
 ❌ Hook faible ou long (> 8 mots avant la première info choc)
 ❌ Longueur dans la zone morte (30-60 secondes / 40-130 mots)
 ❌ Pas de chiffre, pas d'histoire, pas de débat, pas d'émotion
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. PATTERNS SPÉCIFIQUES AU FORMAT AUDIT MARVIN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PATTERNS SPÉCIFIQUES AU FORMAT AUDIT MARVIN (issus de l'analyse des transcripts réels) :
+
+FORMAT 1 — LE VERDICT BRUTAL (priorité maximale)
+Un moment où Marvin balance une vérité dure en 1-2 phrases courtes et directes.
+Exemples réels : "Tu as perdu 7 ans.", "Ce n'est pas le modèle qui s'essouffle, c'est toi.", "Un dirigeant qui ne vend pas, c'est comme un humain sans bras.", "Tu travailles pour rien."
+Signal de détection : phrase courte + silence ou réaction de l'interlocuteur juste après. Durée idéale : 15-25 secondes.
+
+FORMAT 2 — CHIFFRE D'HEURES VS ARGENT (très viral)
+Un moment où on confronte le nombre d'heures travaillées au salaire ou résultat obtenu.
+Exemples réels : "70h/semaine pour 2 400€", "80h semaine, 2 000€ sur le compte", "84 mois jetés à la poubelle".
+Signal de détection : mention explicite d'heures de travail + montant en euros dans le même extrait.
+
+FORMAT 3 — LA CONTRADICTION CHOQUANTE
+Quelqu'un qui semble réussir mais cache un problème énorme, ou l'inverse.
+Exemples réels : "Elle gagne 25 000€/mois en freelance et elle lâche tout", "Il chiffre 500 000€ de devis par mois et en signe 10%", "Il a vendu ses parts 300 000€ et aujourd'hui il se paye zéro".
+Signal de détection : deux informations contradictoires dans le même extrait (grand chiffre + échec, ou sacrifice + résultat nul).
+
+FORMAT 4 — LA MÉTAPHORE CHOC COURTE
+Une comparaison inattendue et mémorable que Marvin utilise pour expliquer un concept.
+Exemples réels : "La frontière entre l'entrepreneur génie et le menteur est hyper fine", "Dès que tu te mens à toi-même, ça revient comme un boomerang", "Mettre des process avant les ventes, c'est fou".
+Signal de détection : structure analogique courte, formule percutante, souvent < 20 mots.
+
+FORMAT 5 — LE MOMENT PERSONNEL/FAMILLE INATTENDU
+Un moment où la conversation bascule sur la vie personnelle, le couple, les enfants, les sacrifices.
+Exemples réels : "Sa femme a quitté la boîte pour la sauver", "Il n'a pas vu grandir son 1er enfant", "Il travaille avec sa sœur et ne veut pas la virer".
+Signal de détection : mention de femme/enfant/famille + lien direct avec la situation business.
+
+RÈGLE ADDITIONNELLE SUR LA SÉLECTION :
+Priorise les extraits où l'interlocuteur reçoit un verdict et réagit (silence, "ouais...", acquiescement gêné) — cette dynamique tension/réaction est ce qui retient le spectateur.
+Évite les extraits purement explicatifs sans tension émotionnelle, même s'ils contiennent des chiffres.
 """
 
 BOUNDARY_PROMPT = """\
